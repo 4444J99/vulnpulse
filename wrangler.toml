@@ -1,0 +1,33 @@
+name = "vulnpulse"
+main = "src/index.ts"
+compatibility_date = "2026-04-01"
+compatibility_flags = ["nodejs_compat"]
+
+[assets]
+directory = "public"
+binding = "ASSETS"
+
+[ai]
+binding = "AI"
+
+# CVE polling every 6 hours; daily digest stamp at 12:00 UTC.
+[triggers]
+crons = ["0 0,6,12,18 * * *"]
+
+[[kv_namespaces]]
+binding = "VP_CVES"
+id = "efcfc20caadd4b8b9f54c14140a926a1"
+
+[[kv_namespaces]]
+binding = "VP_DIGEST"
+id = "2dddf2f7887145d7819dc4a789c3ce59"
+
+[[kv_namespaces]]
+binding = "VP_SUBS"
+id = "9077c2dbbea2465fb30324d0d02332a7"
+
+[vars]
+USER_AGENT = "Mozilla/5.0 (compatible; VulnPulse/0.1; +https://vulnpulse.ivixivi.workers.dev)"
+
+[observability]
+enabled = true

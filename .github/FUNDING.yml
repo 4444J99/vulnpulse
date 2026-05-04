@@ -1,0 +1,5 @@
+# GitHub Sponsors funding configuration for VulnPulse.
+# Pay-any-rail philosophy — multiple paths so users don't get blocked on one processor.
+github: [4444J99]
+custom:
+  - "https://vulnpulse.ivixivi.workers.dev/api/rails"

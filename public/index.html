@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VulnPulse — defender's CVE feed. Patch what matters, ignore the rest.</title>
+<meta name="description" content="High+critical CVEs from NVD, AI-summarized for impact and mitigation priority. Defender-side triage. Free daily digest. Real-time webhooks for paid tier.">
+<meta property="og:title" content="VulnPulse — defender's CVE feed">
+<meta property="og:description" content="High+critical CVEs from NVD, AI-summarized for impact and mitigation priority.">
+<style>
+:root { --bg:#0a0a0f; --fg:#eef0f3; --muted:#7d8794; --accent:#ef4444; --critical:#dc2626; --high:#f97316; --patch-now:#dc2626; --patch-soon:#f59e0b; --monitor:#a78bfa; --low:#71717a; --card:#13141c; --border:#1f2129; --ok:#22c55e; }
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--fg);font-family:-apple-system,system-ui,sans-serif;line-height:1.6;padding:32px 16px;max-width:780px;margin:0 auto;font-size:16px}
+header{text-align:center;padding:20px 0 28px}
+h1{font-size:42px;letter-spacing:-0.03em;display:inline-block}
+h1 .pulse{color:var(--accent)}
+.tag{color:var(--muted);font-size:18px;margin-top:6px}
+section{margin:32px 0}
+h2{font-size:22px;margin-bottom:12px}
+.headline{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:18px;font-size:18px;line-height:1.4}
+.cve{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:14px;margin:10px 0}
+.cve h3{font-size:15px;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}
+.cve-id{font-family:ui-monospace,monospace;color:var(--accent)}
+.score{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:700}
+.score.critical{background:var(--critical);color:#fff}
+.score.high{background:var(--high);color:#000}
+.priority{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px}
+.priority.patch_now{background:var(--patch-now);color:#fff;animation:pulse-now 2s infinite}
+.priority.patch_soon{background:var(--patch-soon);color:#000}
+.priority.monitor{background:var(--monitor);color:#fff}
+.priority.low{background:var(--low);color:#fff}
+@keyframes pulse-now{0%,100%{opacity:1}50%{opacity:0.7}}
+.cve p{color:var(--muted);font-size:14px;margin:6px 0}
+.cve .impact{color:var(--fg);font-size:14px}
+.cve .mitigation{color:var(--ok);font-size:13px;font-style:italic}
+.tags{display:flex;gap:4px;flex-wrap:wrap;margin-top:6px}
+.tag-chip{background:#0a0c10;color:var(--muted);font-size:11px;padding:2px 6px;border-radius:3px;border:1px solid var(--border);font-family:ui-monospace,monospace}
+.refs{font-size:12px;color:var(--muted);margin-top:6px}
+.refs a{color:var(--muted);text-decoration:underline}
+.meta{color:var(--muted);font-size:13px;display:flex;justify-content:space-between;margin-top:14px;flex-wrap:wrap;gap:8px}
+.code{background:var(--card);border:1px solid var(--border);border-radius:6px;padding:12px;font-family:ui-monospace,monospace;font-size:13px;white-space:pre-wrap;overflow-x:auto;color:var(--muted)}
+.pricing{display:grid;gap:14px;grid-template-columns:1fr 1fr 1fr}
+@media(max-width:600px){.pricing{grid-template-columns:1fr}}
+.tier{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:16px;position:relative}
+.tier.featured{border-color:var(--accent)}
+.tier.featured::before{content:"recommended";position:absolute;top:-9px;right:10px;background:var(--accent);color:#000;font-size:10px;padding:2px 8px;border-radius:3px;font-weight:700}
+.tier h3{font-size:16px}
+.tier .price{font-size:24px;font-weight:700;margin:6px 0}
+.tier ul{list-style:none;font-size:13px;color:var(--muted)}
+.tier li{padding:2px 0}
+.tier li::before{content:"→ ";color:var(--accent)}
+button{background:var(--accent);color:#fff;border:0;padding:10px 18px;border-radius:6px;font-weight:600;cursor:pointer;font-size:14px}
+button:hover{filter:brightness(1.1)}
+button:disabled{opacity:0.5;cursor:wait}
+.rails{background:#0c0d13;border:1px solid var(--border);border-radius:8px;padding:14px;font-size:13px}
+.rails .row{display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--border);gap:8px;flex-wrap:wrap}
+.rails .row:last-child{border:0}
+.rails .label{color:var(--muted);min-width:120px}
+.rails .val{font-family:ui-monospace,monospace;font-size:12px;color:var(--fg);word-break:break-all}
+.rails .status{font-size:11px;font-weight:700;padding:2px 6px;border-radius:3px}
+.rails .status.live{background:var(--ok);color:#000}
+.rails .status.latent{background:var(--monitor);color:#fff}
+footer{text-align:center;color:var(--muted);font-size:13px;border-top:1px solid var(--border);padding-top:14px;margin-top:36px}
+footer p{margin:4px 0}
+a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
+.sister-products{display:flex;flex-wrap:wrap;gap:6px;justify-content:center;margin-top:8px}
+.sister-products a{background:var(--card);border:1px solid var(--border);padding:4px 10px;border-radius:14px;font-size:12px}
+input[type=email],input[type=url]{width:100%;background:#0a0c10;border:1px solid var(--border);color:var(--fg);padding:10px;border-radius:6px;font-size:14px;font-family:inherit}
+.subscribe-form{display:flex;gap:8px;margin-top:8px}
+.subscribe-form input{flex:1}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Vuln<span class="pulse">Pulse</span></h1>
+  <p class="tag">High+critical CVEs from NVD, AI-summarized for triage. Defender-side.</p>
+</header>
+
+<section>
+  <h2>Today's pulse</h2>
+  <div id="latest" class="headline">loading…</div>
+  <div class="meta"><span id="generated-at">—</span><button onclick="runNow()" id="run-btn">Run now</button></div>
+</section>
+
+<section>
+  <h2>Patch-now feed</h2>
+  <div id="patch-now-list">loading…</div>
+</section>
+
+<section>
+  <h2>API</h2>
+  <p style="color:var(--muted);font-size:14px">All endpoints are JSON. Free tier: ~50 requests / day per IP.</p>
+  <div class="code">GET  /api/digest/latest      — Today's full digest
+GET  /api/digest/history     — Last 30 daily digests
+GET  /api/critical           — Just CVSS 9.0+ from latest
+GET  /api/patch-now          — Highlights flagged patch_now
+GET  /api/cve/CVE-YYYY-XXXXX — Specific CVE detail
+POST /api/subscribe          — Email or webhook subscription
+GET  /api/rails              — Active payment rails (crypto/sponsors/stripe/bmc)
+GET  /api/status             — System health</div>
+</section>
+
+<section>
+  <h2>Subscribe (free tier — daily email)</h2>
+  <div class="subscribe-form">
+    <input id="sub-email" type="email" placeholder="you@example.com">
+    <button onclick="subscribe()" id="sub-btn">Subscribe</button>
+  </div>
+  <p style="color:var(--muted);font-size:12px;margin-top:6px" id="sub-msg">Free tier: daily digest at 12:00 UTC. No spam, unsubscribe anytime.</p>
+</section>
+
+<section>
+  <h2>Pricing</h2>
+  <div class="pricing">
+    <div class="tier">
+      <h3>Free</h3>
+      <div class="price">$0</div>
+      <ul>
+        <li>Daily digest (this page)</li>
+        <li>Email digest</li>
+        <li>Public API (50/day)</li>
+        <li>24h delay on raw CVE data</li>
+      </ul>
+    </div>
+    <div class="tier featured">
+      <h3>Pro</h3>
+      <div class="price">$29 <small style="font-size:13px;color:var(--muted)">/ mo</small></div>
+      <ul>
+        <li>Real-time webhook on patch_now</li>
+        <li>Custom severity threshold</li>
+        <li>Filter by class (web/cloud/iot/…)</li>
+        <li>Filter by CWE / tag</li>
+        <li>API: 5000/day</li>
+      </ul>
+    </div>
+    <div class="tier">
+      <h3>Team</h3>
+      <div class="price">$99 <small style="font-size:13px;color:var(--muted)">/ mo</small></div>
+      <ul>
+        <li>Everything in Pro</li>
+        <li>5 webhooks (Slack/Teams/PagerDuty)</li>
+        <li>API: 50000/day</li>
+        <li>Custom CVE-watch list</li>
+        <li>SLA: 5-min from NVD publish</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>Pay any way</h2>
+  <p style="color:var(--muted);font-size:14px;margin-bottom:8px">VulnPulse takes payment through multiple rails so you can pay how you want, on any clock. Card payments are activating; the others are live.</p>
+  <div id="rails" class="rails">
+    <div class="row"><span class="label">Crypto (USDC)</span><span class="val" id="rail-crypto">loading…</span></div>
+    <div class="row"><span class="label">GitHub Sponsors</span><span class="val"><a href="https://github.com/sponsors/4444J99" target="_blank">github.com/sponsors/4444J99</a></span><span class="status live">LIVE</span></div>
+    <div class="row"><span class="label">Buy Me a Coffee</span><span class="val" id="rail-bmc">loading…</span></div>
+    <div class="row"><span class="label">Stripe Checkout</span><span class="val">card_payments activating</span><span class="status latent" id="rail-stripe">LATENT</span></div>
+  </div>
+</section>
+
+<section>
+  <h2>For who</h2>
+  <p style="color:var(--muted);font-size:14px">SOC analysts who already get the full NVD firehose and want the 5% that matters. SREs who patch the prod stack on Friday afternoon. Founders who want to know which CVE will set their DM on fire next week. Anyone who reads NVD anyway and would prefer the AI-prioritized version.</p>
+</section>
+
+<footer>
+  <p>VulnPulse • <a href="/api/digest/latest">latest API</a> • Source: NVD JSON 2.0</p>
+  <p>Sister products from the same operator portfolio:</p>
+  <div class="sister-products">
+    <a href="https://promptscope.ivixivi.workers.dev">PromptScope</a>
+    <a href="https://edgarflash.ivixivi.workers.dev">EdgarFlash</a>
+    <a href="https://writelens.ivixivi.workers.dev">WriteLens</a>
+    <a href="https://bountyscope.ivixivi.workers.dev">BountyScope</a>
+    <a href="https://trendpulse.ivixivi.workers.dev">TrendPulse</a>
+  </div>
+</footer>
+
+<script>
+async function loadLatest() {
+  try {
+    const r = await fetch('/api/digest/latest');
+    const d = await r.json();
+    if (d.message) {
+      document.getElementById('latest').innerHTML = `<em>${escapeHtml(d.message)}</em>`;
+      document.getElementById('generated-at').textContent = '';
+      return;
+    }
+    let html = `<strong>${escapeHtml(d.one_line || '(no headline)')}</strong>`;
+    html += `<div style="margin-top:10px;color:var(--muted);font-size:13px">${d.total_cves} CVE${d.total_cves===1?'':'s'} • ${d.critical_count} critical • ${d.high_count} high • ${d.patch_now_ids?.length||0} patch-now</div>`;
+    for (const c of (d.highlights || []).slice(0, 8)) {
+      html += renderCVE(c);
+    }
+    document.getElementById('latest').innerHTML = html;
+    document.getElementById('generated-at').textContent = `Generated ${escapeHtml(d.generated_at || '')}`;
+  } catch (e) {
+    document.getElementById('latest').textContent = 'feed unavailable';
+  }
+}
+
+async function loadPatchNow() {
+  try {
+    const r = await fetch('/api/patch-now');
+    const d = await r.json();
+    const list = d.patch_now || [];
+    if (list.length === 0) {
+      document.getElementById('patch-now-list').innerHTML = '<em style="color:var(--muted)">No patch-now flags in the last 24h. Quiet day.</em>';
+      return;
+    }
+    document.getElementById('patch-now-list').innerHTML = list.map(renderCVE).join('');
+  } catch (e) {
+    document.getElementById('patch-now-list').textContent = 'feed unavailable';
+  }
+}
+
+async function loadRails() {
+  try {
+    const r = await fetch('/api/rails');
+    const d = await r.json();
+    document.getElementById('rail-crypto').innerHTML = d.crypto
+      ? `<code>${escapeHtml(d.crypto)}</code> <span class="status live">LIVE</span>`
+      : 'wallet pending — operator setup';
+    document.getElementById('rail-bmc').innerHTML = d.bmc_url
+      ? `<a href="${escapeHtml(d.bmc_url)}" target="_blank">${escapeHtml(d.bmc_url)}</a> <span class="status live">LIVE</span>`
+      : 'BMC pending';
+    if (d.stripe_active) {
+      document.getElementById('rail-stripe').textContent = 'LIVE';
+      document.getElementById('rail-stripe').className = 'status live';
+    }
+  } catch (e) {}
+}
+
+function renderCVE(c) {
+  const sev = (c.severity || 'HIGH').toLowerCase();
+  const pri = (c.ai_priority || '').toLowerCase();
+  const tags = (c.ai_tags || []).map(t => `<span class="tag-chip">${escapeHtml(t)}</span>`).join('');
+  const refs = (c.references || []).slice(0, 3).map(u =>
+    `<a href="${escapeHtml(u)}" target="_blank" rel="noopener">${escapeHtml(new URL(u).hostname)}</a>`
+  ).join(' • ');
+  return `<div class="cve">
+    <h3>
+      <span><span class="cve-id">${escapeHtml(c.id)}</span> <span class="score ${sev}">${escapeHtml(String(c.cvss_score))} ${escapeHtml(c.severity)}</span></span>
+      ${pri ? `<span class="priority ${pri}">${escapeHtml(pri.replace('_',' '))}</span>` : ''}
+    </h3>
+    ${c.ai_impact ? `<p class="impact">${escapeHtml(c.ai_impact)}</p>` : `<p>${escapeHtml((c.description||'').slice(0,260))}…</p>`}
+    ${c.ai_mitigation ? `<p class="mitigation">→ ${escapeHtml(c.ai_mitigation)}</p>` : ''}
+    ${tags ? `<div class="tags">${tags}</div>` : ''}
+    ${refs ? `<div class="refs">${refs}</div>` : ''}
+  </div>`;
+}
+
+async function runNow() {
+  const btn = document.getElementById('run-btn');
+  btn.disabled = true; btn.textContent = 'collecting…';
+  try {
+    const r = await fetch('/api/run-now', { method: 'POST' });
+    const d = await r.json();
+    if (!r.ok) { alert(d.error || 'failed'); return; }
+    await loadLatest();
+    await loadPatchNow();
+  } finally {
+    btn.disabled = false; btn.textContent = 'Run now';
+  }
+}
+
+async function subscribe() {
+  const btn = document.getElementById('sub-btn');
+  const email = document.getElementById('sub-email').value.trim();
+  const msg = document.getElementById('sub-msg');
+  if (!email || !/^[^@]+@[^@]+\.[^@]+$/.test(email)) { msg.textContent = 'enter a valid email'; return; }
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/subscribe', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, tier: 'free' })
+    });
+    const d = await r.json();
+    msg.textContent = r.ok ? `subscribed (${d.ident_hash})` : (d.error || 'failed');
+    if (r.ok) document.getElementById('sub-email').value = '';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function escapeHtml(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+loadLatest();
+loadPatchNow();
+loadRails();
+</script>
+
+</body>
+</html>
