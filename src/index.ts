@@ -230,20 +230,32 @@ async function runCron(env: Env): Promise<Digest> {
   console.log(`vulnpulse: NVD returned ${raw.length} CVEs (CVSS>=7.0, last 24h)`);
 
   // Cap summarization to top N by score to stay within Workers-AI quota.
+  // Skip puts for CVEs already in KV (the 24h rolling window overlaps prior
+  // crons). Workers KV gets are 100k/day free vs puts at 1k/day, so the
+  // pre-check is cheap insurance against the limit even if cron cadence
+  // changes back to multiple-per-day.
   const targets = raw.slice(0, SUMMARY_CAP);
   const summaries: SummarizedCVE[] = [];
   for (const cve of targets) {
     const s = await summarizeCVE(cve, env);
     summaries.push(s);
-    await env.VP_CVES.put(`${CVE_KEY_PREFIX}${cve.id}`, JSON.stringify(s), {
-      expirationTtl: 60 * 60 * 24 * 30,
-    });
+    const key = `${CVE_KEY_PREFIX}${cve.id}`;
+    const existing = await env.VP_CVES.get(key);
+    if (!existing) {
+      await env.VP_CVES.put(key, JSON.stringify(s), {
+        expirationTtl: 60 * 60 * 24 * 30,
+      });
+    }
   }
   // Store the un-summarized rest verbatim so list endpoints have full count.
   for (const c of raw.slice(SUMMARY_CAP)) {
-    await env.VP_CVES.put(`${CVE_KEY_PREFIX}${c.id}`, JSON.stringify(c), {
-      expirationTtl: 60 * 60 * 24 * 30,
-    });
+    const key = `${CVE_KEY_PREFIX}${c.id}`;
+    const existing = await env.VP_CVES.get(key);
+    if (!existing) {
+      await env.VP_CVES.put(key, JSON.stringify(c), {
+        expirationTtl: 60 * 60 * 24 * 30,
+      });
+    }
   }
 
   const critical = raw.filter(r => r.severity === 'CRITICAL');

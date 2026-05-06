@@ -10,9 +10,12 @@ binding = "ASSETS"
 [ai]
 binding = "AI"
 
-# CVE polling every 6 hours; daily digest stamp at 12:00 UTC.
+# Cron once daily at 12:00 UTC. Was every-6h, but each cycle re-put the full
+# 24h-rolling-window of CVEs to KV (≈250 CVEs × 4 cycles = ~1000 puts/day),
+# exhausting the Workers KV free-tier 1k put/day limit. With daily cadence
+# plus get-before-put (see runCron), each CVE is written at most once per day.
 [triggers]
-crons = ["0 0,6,12,18 * * *"]
+crons = ["0 12 * * *"]
 
 [[kv_namespaces]]
 binding = "VP_CVES"
