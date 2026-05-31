@@ -31,6 +31,16 @@ id = "9077c2dbbea2465fb30324d0d02332a7"
 
 [vars]
 USER_AGENT = "Mozilla/5.0 (compatible; VulnPulse/0.1; +https://vulnpulse.ivixivi.workers.dev)"
+# Shared fleet money rail (public-hostname fallback; SHIP_HMAC_SECRET stays a wrangler secret, unset).
+PAYRAIL_URL = "https://payrail.ivixivi.workers.dev"
+
+# Service binding to the payrail Worker — the PREFERRED rail path. An internal
+# worker→worker call that never hits the public edge, so it sidesteps both the
+# *.workers.dev same-zone fetch restriction and edge bot-management (which were
+# turning the public-hostname fetch into a 502 rail_unavailable).
+[[services]]
+binding = "PAYRAIL"
+service = "payrail"
 
 [observability]
 enabled = true
