@@ -133,6 +133,7 @@ GET  /api/status             — System health</div>
         <li>Filter by CWE / tag</li>
         <li>API: 5000/day</li>
       </ul>
+      <button onclick="upgrade('pro')" style="margin-top:12px;width:100%">Upgrade — pay with USDC</button>
     </div>
     <div class="tier">
       <h3>Team</h3>
@@ -144,8 +145,32 @@ GET  /api/status             — System health</div>
         <li>Custom CVE-watch list</li>
         <li>SLA: 5-min from NVD publish</li>
       </ul>
+      <button onclick="upgrade('team')" style="margin-top:12px;width:100%">Upgrade — pay with USDC</button>
     </div>
   </div>
+</section>
+
+<section id="checkout" style="display:none">
+  <h2 id="checkout-title">Upgrade</h2>
+  <p style="color:var(--muted);font-size:13px" id="checkout-sub">Pay once with USDC on Base. You'll get an address and a unique memo — send, then paste your transaction hash to unlock instantly. No card, no account.</p>
+  <div class="subscribe-form">
+    <input id="co-email" type="email" placeholder="you@company.com">
+    <button onclick="startCheckout()" id="co-btn">Get payment details</button>
+  </div>
+  <div id="co-quote" style="display:none;margin-top:14px">
+    <div class="rails">
+      <div class="row"><span class="label">Amount</span><span class="val" id="q-amount"></span></div>
+      <div class="row"><span class="label">Asset / chain</span><span class="val" id="q-asset"></span></div>
+      <div class="row"><span class="label">Send to</span><span class="val" id="q-address"></span><button onclick="copyAddr()" id="q-copy" style="font-size:11px;padding:4px 8px">copy</button></div>
+      <div class="row"><span class="label">Memo (quote id)</span><span class="val" id="q-quote"></span></div>
+    </div>
+    <p style="color:var(--muted);font-size:13px;margin-top:8px" id="q-instructions"></p>
+    <div class="subscribe-form" style="margin-top:10px">
+      <input id="co-tx" type="text" placeholder="0x… transaction hash">
+      <button onclick="confirmTx()" id="co-confirm-btn">I've sent it — unlock</button>
+    </div>
+  </div>
+  <p style="font-size:13px;margin-top:8px" id="co-msg"></p>
 </section>
 
 <section>
@@ -279,6 +304,84 @@ async function subscribe() {
     if (r.ok) document.getElementById('sub-email').value = '';
   } finally {
     btn.disabled = false;
+  }
+}
+
+let CO = { tier: null, quote_id: null, address: null, confirm_url: '/api/confirm' };
+
+function upgrade(tier) {
+  CO.tier = tier;
+  const price = tier === 'team' ? '99' : '29';
+  const label = tier.charAt(0).toUpperCase() + tier.slice(1);
+  document.getElementById('checkout-title').textContent = `Upgrade to ${label} — $${price}/mo`;
+  const sec = document.getElementById('checkout');
+  sec.style.display = '';
+  document.getElementById('co-quote').style.display = 'none';
+  document.getElementById('co-msg').textContent = '';
+  sec.scrollIntoView({ behavior: 'smooth' });
+  document.getElementById('co-email').focus();
+}
+
+async function startCheckout() {
+  const btn = document.getElementById('co-btn');
+  const email = document.getElementById('co-email').value.trim();
+  const msg = document.getElementById('co-msg');
+  if (!email || !/^[^@]+@[^@]+\.[^@]+$/.test(email)) { msg.style.color = 'var(--high)'; msg.textContent = 'enter a valid email'; return; }
+  btn.disabled = true; btn.textContent = 'getting quote…';
+  try {
+    const r = await fetch('/api/subscribe', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, tier: CO.tier })
+    });
+    const d = await r.json();
+    if (r.status === 402 && d.pay_to) {
+      CO.quote_id = d.quote_id; CO.address = d.pay_to.address; CO.confirm_url = d.confirm_url || '/api/confirm';
+      document.getElementById('q-amount').textContent = `${d.pay_to.amount} ${d.pay_to.asset}`;
+      document.getElementById('q-asset').textContent = `${d.pay_to.asset} on ${d.pay_to.chain}`;
+      document.getElementById('q-address').textContent = d.pay_to.address;
+      document.getElementById('q-quote').textContent = d.quote_id;
+      document.getElementById('q-instructions').textContent = d.instructions || '';
+      document.getElementById('co-quote').style.display = '';
+      msg.style.color = 'var(--muted)'; msg.textContent = 'Send the exact amount, then paste your transaction hash below.';
+    } else if (r.ok) {
+      msg.style.color = 'var(--ok)'; msg.textContent = d.message || 'subscribed';
+    } else {
+      msg.style.color = 'var(--high)'; msg.textContent = d.error || 'could not start checkout';
+    }
+  } catch (e) {
+    msg.style.color = 'var(--high)'; msg.textContent = 'network error — try again';
+  } finally {
+    btn.disabled = false; btn.textContent = 'Get payment details';
+  }
+}
+
+async function copyAddr() {
+  try {
+    await navigator.clipboard.writeText(CO.address || '');
+    const b = document.getElementById('q-copy'); b.textContent = 'copied';
+    setTimeout(() => { b.textContent = 'copy'; }, 1500);
+  } catch (e) {}
+}
+
+async function confirmTx() {
+  const btn = document.getElementById('co-confirm-btn');
+  const tx = document.getElementById('co-tx').value.trim();
+  const msg = document.getElementById('co-msg');
+  if (!/^0x[0-9a-fA-F]{6,}$/.test(tx)) { msg.style.color = 'var(--high)'; msg.textContent = 'paste a valid 0x… transaction hash'; return; }
+  if (!CO.quote_id) { msg.style.color = 'var(--high)'; msg.textContent = 'get a payment quote first'; return; }
+  btn.disabled = true; btn.textContent = 'verifying…';
+  try {
+    const r = await fetch(CO.confirm_url, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ quote_id: CO.quote_id, tx_hash: tx })
+    });
+    const d = await r.json();
+    if (r.ok) { msg.style.color = 'var(--ok)'; msg.textContent = `✓ ${CO.tier} unlocked — receipt recorded. We'll email your webhook setup.`; }
+    else { msg.style.color = 'var(--high)'; msg.textContent = d.error || 'payment not verified yet — on-chain confirmation can take a moment, try again shortly'; }
+  } catch (e) {
+    msg.style.color = 'var(--high)'; msg.textContent = 'network error — try again';
+  } finally {
+    btn.disabled = false; btn.textContent = "I've sent it — unlock";
   }
 }
 
