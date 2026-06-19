@@ -8,13 +8,14 @@
   "scripts": {
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
+    "test": "vitest run test/index.test.ts && node --import tsx --test test/vulnpulse.test.mjs",
     "build": "wrangler deploy --dry-run --outdir dist"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250101.0",
     "@eslint/js": "^9.17.0",
     "eslint": "^9.17.0",
+    "tsx": "^4.19.2",
     "typescript": "^5.7.2",
     "typescript-eslint": "^8.18.0",
     "vitest": "^2.1.8",

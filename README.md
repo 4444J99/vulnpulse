@@ -74,6 +74,17 @@ See [PRICING.md](./PRICING.md) for the full gate spec (auth, quotas, delay rules
 - Cloudflare KV — CVE storage, daily digest archive, subscription list
 - NVD JSON 2.0 API — public CVE source
 
+## Development
+
+Run the automated test suite with:
+
+```
+npm test
+```
+
+The tests use Node's built-in test runner with in-memory Worker bindings, so they
+do not need live Cloudflare services.
+
 ## Sister products
 
 VulnPulse is part of an intelligence portfolio:
