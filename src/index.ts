@@ -14,6 +14,90 @@
  * Source: NVD (https://services.nvd.nist.gov/rest/json/cves/2.0) — free, public.
  */
 
+// ── Structured Logging ──────────────────────────────────────────────────────
+
+type LogLevel = 'info' | 'warn' | 'error' | 'debug';
+
+interface LogEntry {
+  level: LogLevel;
+  ts: string;
+  rid: string;
+  msg: string;
+  [k: string]: unknown;
+}
+
+function genRid(): string {
+  const c = crypto.getRandomValues(new Uint8Array(6));
+  const ts = Date.now().toString(36).slice(-6);
+  return ts + '-' + [...c].map(b => b.toString(36).padStart(2, '0')).join('');
+}
+
+function structuredLog(rid: string, level: LogLevel, msg: string, meta?: Record<string, unknown>): void {
+  const entry: LogEntry = { level, ts: new Date().toISOString(), rid, msg, ...meta };
+  const line = JSON.stringify(entry);
+  if (level === 'error') console.error(line);
+  else if (level === 'warn') console.warn(line);
+  else console.log(line);
+}
+
+// ── Input Validation Helpers ────────────────────────────────────────────────
+
+const HTTP_BODY_MAX = 16_384;
+
+function validEmail(s: string): boolean {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s) && s.length <= 254;
+}
+
+function validUrl(s: string): boolean {
+  try {
+    const u = new URL(s);
+    return u.protocol === 'http:' || u.protocol === 'https:';
+  } catch { return false; }
+}
+
+function validWebhookUrl(s: string): boolean {
+  return validUrl(s);
+}
+
+function requireContentType(req: Request, expected: string): boolean {
+  const ct = req.headers.get('content-type') ?? '';
+  return ct.startsWith(expected);
+}
+
+function requireBody(req: Request, rid: string): Promise<unknown> {
+  const cl = req.headers.get('content-length');
+  if (cl && Number(cl) > HTTP_BODY_MAX) {
+    throw new HttpError(413, 'payload_too_large', `Request body exceeds ${HTTP_BODY_MAX} bytes`);
+  }
+  return req.json().catch(() => {
+    throw new HttpError(400, 'invalid_json', 'Request body must be valid JSON');
+  });
+}
+
+// ── Error Types ─────────────────────────────────────────────────────────────
+
+class HttpError extends Error {
+  constructor(
+    public status: number,
+    public code: string,
+    msg?: string,
+    public detail?: unknown,
+  ) {
+    super(msg ?? code);
+    this.name = 'HttpError';
+  }
+}
+
+function errorBody(status: number, code: string, msg?: string, extra?: Record<string, unknown>) {
+  return Response.json({ error: code, ...(msg ? { message: msg } : {}), ...extra }, { status });
+}
+
+function errorBodyWithHeaders(status: number, code: string, headers: Record<string, string>, msg?: string, extra?: Record<string, unknown>) {
+  return Response.json({ error: code, ...(msg ? { message: msg } : {}), ...extra }, { status, headers });
+}
+
+// ── Env ─────────────────────────────────────────────────────────────────────
+
 interface Env {
   AI: any;
   ASSETS: Fetcher;
@@ -141,7 +225,7 @@ async function hmacHex(secret: string, message: string): Promise<string> {
 
 // === NVD fetch ===
 
-async function fetchNVDRecent(env: Env, hoursBack = 24): Promise<RawCVE[]> {
+async function fetchNVDRecent(env: Env, rid: string, hoursBack = 24): Promise<RawCVE[]> {
   const end = new Date();
   const start = new Date(end.getTime() - hoursBack * 60 * 60 * 1000);
   // NVD requires ISO-8601 with millis and ±HH:MM offset
@@ -156,7 +240,7 @@ async function fetchNVDRecent(env: Env, hoursBack = 24): Promise<RawCVE[]> {
     headers: { 'User-Agent': env.USER_AGENT, 'Accept': 'application/json' },
   });
   if (!r.ok) {
-    console.error('NVD fetch HIGH failed:', r.status, await r.text().catch(() => ''));
+    structuredLog(rid, 'error', 'nvd_fetch_failed', { severity: 'HIGH', status: r.status, detail: await r.text().catch(() => '') });
   }
   const high = r.ok ? parseNVDResponse(await r.json()) : [];
 
@@ -165,7 +249,7 @@ async function fetchNVDRecent(env: Env, hoursBack = 24): Promise<RawCVE[]> {
     headers: { 'User-Agent': env.USER_AGENT, 'Accept': 'application/json' },
   });
   if (!r2.ok) {
-    console.error('NVD fetch CRITICAL failed:', r2.status, await r2.text().catch(() => ''));
+    structuredLog(rid, 'error', 'nvd_fetch_failed', { severity: 'CRITICAL', status: r2.status, detail: await r2.text().catch(() => '') });
   }
   const crit = r2.ok ? parseNVDResponse(await r2.json()) : [];
 
@@ -255,7 +339,7 @@ export function tryParseJson(s: unknown): any | null {
   try { return JSON.parse(cleaned); } catch { return null; }
 }
 
-async function summarizeCVE(cve: RawCVE, env: Env): Promise<SummarizedCVE> {
+async function summarizeCVE(cve: RawCVE, env: Env, rid: string): Promise<SummarizedCVE> {
   const prompt = `CVE: ${cve.id}
 CVSS: ${cve.cvss_score} (${cve.severity})
 Vector: ${cve.vector ?? '(unknown)'}
@@ -275,7 +359,7 @@ Respond with the JSON object only.`;
       max_tokens: 600,
     });
   } catch (err) {
-    console.error('summarize failed for', cve.id, err);
+    structuredLog(rid, 'error', 'ai_summarize_failed', { cve_id: cve.id, error: String(err) });
     return cve;
   }
   const raw = aiResp?.response ?? aiResp?.result ?? aiResp;
@@ -296,9 +380,11 @@ Respond with the JSON object only.`;
 
 // === Cron ===
 
-async function runCron(env: Env): Promise<Digest> {
-  const raw = await fetchNVDRecent(env, 24);
-  console.log(`vulnpulse: NVD returned ${raw.length} CVEs (CVSS>=7.0, last 24h)`);
+async function runCron(env: Env, rid?: string): Promise<Digest> {
+  if (!rid) rid = genRid();
+  structuredLog(rid, 'info', 'cron_started');
+  const raw = await fetchNVDRecent(env, rid, 24);
+  structuredLog(rid, 'info', 'nvd_fetched', { total: raw.length, window_hours: 24 });
 
   // Cap summarization to top N by score to stay within Workers-AI quota.
   // Skip puts for CVEs already in KV (the 24h rolling window overlaps prior
@@ -308,7 +394,7 @@ async function runCron(env: Env): Promise<Digest> {
   const targets = raw.slice(0, SUMMARY_CAP);
   const summaries: SummarizedCVE[] = [];
   for (const cve of targets) {
-    const s = await summarizeCVE(cve, env);
+    const s = await summarizeCVE(cve, env, rid);
     summaries.push(s);
     const key = `${CVE_KEY_PREFIX}${cve.id}`;
     const existing = await env.VP_CVES.get(key);
@@ -352,7 +438,12 @@ async function runCron(env: Env): Promise<Digest> {
 
   await env.VP_DIGEST.put(`${DIGEST_KEY_PREFIX}${digest.date_label}`, JSON.stringify(digest));
   await env.VP_DIGEST.put(LATEST_KEY, JSON.stringify(digest));
-  console.log(`vulnpulse: digest ${digest.date_label}, ${digest.total_cves} CVEs (${critical.length} crit), ${patchNow.length} patch-now`);
+  structuredLog(rid, 'info', 'cron_completed', {
+    date_label: digest.date_label,
+    total_cves: digest.total_cves,
+    critical: critical.length,
+    patch_now: patchNow.length,
+  });
   return digest;
 }
 
@@ -381,11 +472,19 @@ interface Sub {
   api_key?: string;    // issued at subscribe (free) / confirm (paid)
 }
 
-async function handleSubscribe(req: Request, env: Env): Promise<Response> {
-  if (req.method !== 'POST') return new Response('POST only', { status: 405 });
-  const body = await req.json().catch(() => null) as Partial<Sub> | null;
+async function handleSubscribe(req: Request, env: Env, rid: string): Promise<Response> {
+  if (req.method !== 'POST') return errorBody(405, 'method_not_allowed', 'POST only');
+  if (!requireContentType(req, 'application/json')) return errorBody(415, 'unsupported_media_type', 'content-type must be application/json');
+  structuredLog(rid, 'info', 'subscribe_request');
+  const body = await requireBody(req, rid) as Partial<Sub> | null;
   if (!body || (!body.email && !body.webhook)) {
-    return Response.json({ error: 'email or webhook required' }, { status: 400 });
+    return errorBody(400, 'validation_error', 'email or webhook required');
+  }
+  if (body.email && !validEmail(body.email)) {
+    return errorBody(400, 'validation_error', 'invalid email format');
+  }
+  if (body.webhook && !validWebhookUrl(body.webhook)) {
+    return errorBody(400, 'validation_error', 'invalid webhook URL');
   }
   const ident = body.email ?? body.webhook ?? '';
   const sub: Sub = {
@@ -403,7 +502,8 @@ async function handleSubscribe(req: Request, env: Env): Promise<Response> {
     try {
       q = await payrailQuote(env, sub.tier);
     } catch (err) {
-      return Response.json({ error: 'rail_unavailable', detail: String(err) }, { status: 502 });
+      structuredLog(rid, 'error', 'payrail_quote_failed', { tier: sub.tier, error: String(err) });
+      return errorBody(502, 'rail_unavailable', String(err));
     }
     await env.VP_SUBS.put(
       `pending:${q.quote_id}`,
@@ -446,14 +546,17 @@ function hash(s: string): string {
 // A buyer who paid posts { quote_id, tx_hash }. We forward it to payrail
 // /receipt — the receipt's payer_ref == tx_hash is the TIER-1 artifact — then
 // flip the pending sub to active and unlock the paid tier.
-async function handleConfirm(req: Request, env: Env): Promise<Response> {
-  if (req.method !== 'POST') return new Response('POST only', { status: 405 });
-  const body = await req.json().catch(() => null) as { quote_id?: string; tx_hash?: string } | null;
-  if (!body?.quote_id || !body?.tx_hash) {
-    return Response.json({ error: 'quote_id and tx_hash required' }, { status: 400 });
+async function handleConfirm(req: Request, env: Env, rid: string): Promise<Response> {
+  if (req.method !== 'POST') return errorBody(405, 'method_not_allowed', 'POST only');
+  if (!requireContentType(req, 'application/json')) return errorBody(415, 'unsupported_media_type', 'content-type must be application/json');
+  structuredLog(rid, 'info', 'confirm_request');
+  const body = await requireBody(req, rid) as { quote_id?: string; tx_hash?: string } | null;
+  if (!body?.quote_id || !body?.tx_hash || typeof body.quote_id !== 'string' || typeof body.tx_hash !== 'string') {
+    return errorBody(400, 'validation_error', 'quote_id and tx_hash required (strings)');
   }
   const pendingRaw = await env.VP_SUBS.get(`pending:${body.quote_id}`);
-  if (!pendingRaw) return Response.json({ error: 'quote_not_found_or_expired' }, { status: 404 });
+  if (!pendingRaw) return errorBody(404, 'quote_not_found_or_expired');
+  structuredLog(rid, 'info', 'confirm_pending_found', { quote_id: body.quote_id });
   const pending = JSON.parse(pendingRaw) as Sub & { ident: string; quote_id: string };
   const tier = (pending.tier === 'team' ? 'team' : 'pro') as 'pro' | 'team';
 
@@ -471,10 +574,8 @@ async function handleConfirm(req: Request, env: Env): Promise<Response> {
 
   const rr = await payrailFetch(env, '/receipt', { method: 'POST', headers, body: payload });
   if (!rr.ok) {
-    return Response.json(
-      { error: 'receipt_rejected', status: rr.status, detail: await rr.text().catch(() => '') },
-      { status: 502 },
-    );
+    structuredLog(rid, 'error', 'receipt_rejected', { quote_id: body.quote_id, status: rr.status });
+    return errorBody(502, 'receipt_rejected', undefined, { detail: await rr.text().catch(() => '') });
   }
   const receiptResp = await rr.json().catch(() => ({})) as { ok?: boolean; receipt?: unknown };
 
@@ -500,13 +601,17 @@ async function handleConfirm(req: Request, env: Env): Promise<Response> {
 }
 
 // Poll payment status by proxying payrail's public receipt lookup.
-async function handlePayStatus(req: Request, env: Env): Promise<Response> {
+async function handlePayStatus(req: Request, env: Env, rid: string): Promise<Response> {
   const url = new URL(req.url);
   const quoteId = url.searchParams.get('quote_id');
-  if (!quoteId) return Response.json({ error: 'quote_id required' }, { status: 400 });
+  if (!quoteId) return errorBody(400, 'validation_error', 'quote_id required');
+  structuredLog(rid, 'info', 'pay_status_request', { quote_id: quoteId });
   const r = await payrailFetch(env, `/receipt/${encodeURIComponent(quoteId)}`);
   if (r.status === 404) return Response.json({ paid: false, quote_id: quoteId });
-  if (!r.ok) return Response.json({ error: 'status_unavailable', status: r.status }, { status: 502 });
+  if (!r.ok) {
+    structuredLog(rid, 'error', 'payrail_receipt_failed', { quote_id: quoteId, status: r.status });
+    return errorBody(502, 'status_unavailable');
+  }
   return Response.json({ paid: true, receipt: await r.json() });
 }
 
@@ -571,18 +676,19 @@ function rateHeaders(a: Access): Record<string, string> {
 // Response (401/429) or the granted Access. Counter lives in VP_CVES under the
 // existing rl: prefix; one get + one put per gated request (acceptable at this
 // product's volume — KV's 1k put/day free cap is the operative ceiling).
-async function gateRequest(req: Request, env: Env): Promise<{ access: Access } | { error: Response }> {
+async function gateRequest(req: Request, env: Env, rid: string): Promise<{ access: Access } | { error: Response }> {
   const key = readApiKey(req);
   let tier: Tier = 'free';
   let rateId: string;
   if (key) {
     const raw = await env.VP_SUBS.get(`${API_KEY_PREFIX}${key}`);
     if (!raw) {
-      return { error: Response.json({ error: 'invalid_api_key', hint: 'subscribe at /api/subscribe to get one' }, { status: 401 }) };
+      structuredLog(rid, 'warn', 'gate_invalid_key', { key_prefix: key.slice(0, 8) });
+      return { error: errorBody(401, 'invalid_api_key', 'subscribe at /api/subscribe to get one') };
     }
     let rec: ApiKeyRecord;
     try { rec = JSON.parse(raw) as ApiKeyRecord; } catch {
-      return { error: Response.json({ error: 'invalid_api_key' }, { status: 401 }) };
+      return { error: errorBody(401, 'invalid_api_key') };
     }
     tier = rec.tier === 'pro' || rec.tier === 'team' ? rec.tier : 'free';
     rateId = `key:${hash(key)}`;
@@ -598,10 +704,8 @@ async function gateRequest(req: Request, env: Env): Promise<{ access: Access } |
   const used = Number(await env.VP_CVES.get(rkey)) || 0;
   if (used >= limit) {
     const a: Access = { tier, rate_id: rateId, limit, remaining: 0 };
-    return { error: Response.json(
-      { error: 'rate_limited', tier, limit, retry_after_seconds: secondsUntilUtcMidnight(), upgrade: '/api/pricing' },
-      { status: 429, headers: { ...rateHeaders(a), 'Retry-After': String(secondsUntilUtcMidnight()) } },
-    ) };
+    structuredLog(rid, 'warn', 'gate_rate_limited', { tier, rate_id: rateId, used, limit });
+    return { error: errorBodyWithHeaders(429, 'rate_limited', { ...rateHeaders(a), 'Retry-After': String(secondsUntilUtcMidnight()) }, undefined, { tier, limit, retry_after_seconds: secondsUntilUtcMidnight(), upgrade: '/api/pricing' }) };
   }
   await env.VP_CVES.put(rkey, String(used + 1), { expirationTtl: 60 * 60 * 26 });
   return { access: { tier, rate_id: rateId, limit, remaining: limit - (used + 1) } };
@@ -632,7 +736,7 @@ function capForTier<T>(items: T[], access: Access): { items: T[]; truncated: boo
 
 // === HTTP ===
 
-async function handleLatest(_req: Request, env: Env, access: Access): Promise<Response> {
+async function handleLatest(_req: Request, env: Env, access: Access, rid: string): Promise<Response> {
   const v = await env.VP_DIGEST.get(LATEST_KEY);
   if (!v) {
     return Response.json({
@@ -644,7 +748,7 @@ async function handleLatest(_req: Request, env: Env, access: Access): Promise<Re
   return Response.json(shapeDigestForTier(digest, access), { headers: rateHeaders(access) });
 }
 
-async function handleHistory(_req: Request, env: Env, access: Access): Promise<Response> {
+async function handleHistory(_req: Request, env: Env, access: Access, rid: string): Promise<Response> {
   const list = await env.VP_DIGEST.list({ prefix: DIGEST_KEY_PREFIX, limit: 30 });
   const out: Digest[] = [];
   for (const k of list.keys) {
@@ -657,7 +761,7 @@ async function handleHistory(_req: Request, env: Env, access: Access): Promise<R
   return Response.json({ count: out.length, digests }, { headers: rateHeaders(access) });
 }
 
-async function handleCritical(_req: Request, env: Env, access: Access): Promise<Response> {
+async function handleCritical(_req: Request, env: Env, access: Access, rid: string): Promise<Response> {
   const v = await env.VP_DIGEST.get(LATEST_KEY);
   if (!v) return Response.json({ critical: [] }, { status: 202, headers: rateHeaders(access) });
   const d = JSON.parse(v) as Digest;
@@ -669,7 +773,7 @@ async function handleCritical(_req: Request, env: Env, access: Access): Promise<
   }, { headers: rateHeaders(access) });
 }
 
-async function handlePatchNow(_req: Request, env: Env, access: Access): Promise<Response> {
+async function handlePatchNow(_req: Request, env: Env, access: Access, rid: string): Promise<Response> {
   const v = await env.VP_DIGEST.get(LATEST_KEY);
   if (!v) return Response.json({ patch_now: [] }, { status: 202, headers: rateHeaders(access) });
   const d = JSON.parse(v) as Digest;
@@ -681,46 +785,52 @@ async function handlePatchNow(_req: Request, env: Env, access: Access): Promise<
   }, { headers: rateHeaders(access) });
 }
 
-async function handleCVE(req: Request, env: Env, access: Access): Promise<Response> {
+async function handleCVE(req: Request, env: Env, access: Access, rid: string): Promise<Response> {
   const url = new URL(req.url);
   const id = url.pathname.split('/').pop() ?? '';
   if (!/^CVE-\d{4}-\d{4,}$/.test(id)) {
-    return Response.json({ error: 'invalid CVE id' }, { status: 400, headers: rateHeaders(access) });
+    structuredLog(rid, 'warn', 'cve_invalid_id', { id });
+    return errorBodyWithHeaders(400, 'validation_error', rateHeaders(access), 'invalid CVE id format (expected CVE-YYYY-NNNN)');
   }
   const v = await env.VP_CVES.get(`${CVE_KEY_PREFIX}${id}`);
-  if (!v) return Response.json({ error: 'not_found_in_24h_window' }, { status: 404, headers: rateHeaders(access) });
+  if (!v) {
+    structuredLog(rid, 'info', 'cve_not_found', { id });
+    return errorBodyWithHeaders(404, 'not_found', rateHeaders(access), 'CVE not found in current 24h window');
+  }
   const cve = JSON.parse(v) as SummarizedCVE;
   // Free tier sees raw CVE detail on a 24h delay: a record modified in the last
   // 24h is real-time intel and is reserved for paid tiers.
   if (access.tier === 'free') {
     const modAt = Date.parse(cve.modified || cve.published || '');
     if (!Number.isNaN(modAt) && Date.now() - modAt < FREE_DELAY_MS) {
-      return Response.json({
-        error: 'gated',
+      return errorBodyWithHeaders(402, 'gated', rateHeaders(access), undefined, {
         reason: 'realtime_cve_detail',
         detail: 'Free tier sees CVE detail 24h after last modification. This record is newer.',
         available_at: new Date(modAt + FREE_DELAY_MS).toISOString(),
         upgrade: '/api/pricing',
-      }, { status: 402, headers: rateHeaders(access) });
+      });
     }
   }
   return Response.json(cve, { headers: rateHeaders(access) });
 }
 
-async function handleRunNow(req: Request, env: Env): Promise<Response> {
+async function handleRunNow(req: Request, env: Env, rid: string): Promise<Response> {
+  if (req.method !== 'POST') return errorBody(405, 'method_not_allowed', 'POST only');
   // Rate-limit: per-IP, max 1 manual run per hour.
   const ip = req.headers.get('cf-connecting-ip') ?? 'unknown';
   const rkey = `${RATE_LIMIT_KEY_PREFIX}runnow:${ip}`;
   const last = await env.VP_CVES.get(rkey);
   if (last && Date.now() - Number(last) < 60 * 60 * 1000) {
-    return Response.json({ error: 'rate_limited', retry_after_seconds: 3600 }, { status: 429 });
+    structuredLog(rid, 'warn', 'runnow_rate_limited', { ip_hash: hash(ip) });
+    return errorBody(429, 'rate_limited', undefined, { retry_after_seconds: 3600 });
   }
   await env.VP_CVES.put(rkey, String(Date.now()), { expirationTtl: 3600 });
-  const d = await runCron(env);
+  structuredLog(rid, 'info', 'runnow_triggered', { ip_hash: hash(ip) });
+  const d = await runCron(env, rid);
   return Response.json(d);
 }
 
-async function handleStatus(_req: Request, env: Env): Promise<Response> {
+async function handleStatus(_req: Request, env: Env, rid: string): Promise<Response> {
   const list = await env.VP_CVES.list({ prefix: CVE_KEY_PREFIX, limit: 1 });
   const sample = list.keys[0]?.name?.replace(CVE_KEY_PREFIX, '') ?? null;
   const subList = await env.VP_SUBS.list({ prefix: 'sub:', limit: 1 });
@@ -745,7 +855,7 @@ async function handleStatus(_req: Request, env: Env): Promise<Response> {
   });
 }
 
-async function handleRails(_req: Request, env: Env): Promise<Response> {
+async function handleRails(_req: Request, env: Env, rid: string): Promise<Response> {
   // Public revenue-rail discovery — clients can offer multiple pay options to users.
   return Response.json({
     crypto: env.TREASURY_WALLET ?? null,
@@ -757,7 +867,7 @@ async function handleRails(_req: Request, env: Env): Promise<Response> {
 
 // Machine-readable pricing/tier matrix — the source of truth the README and
 // PRICING.md describe in prose. Clients can render their own upgrade UI from it.
-async function handlePricing(_req: Request, _env: Env): Promise<Response> {
+async function handlePricing(_req: Request, _env: Env, rid: string): Promise<Response> {
   return Response.json({
     currency: 'USD',
     billing: 'monthly',
@@ -790,13 +900,16 @@ async function handlePricing(_req: Request, _env: Env): Promise<Response> {
 
 // Report the caller's resolved tier + today's quota usage. Does NOT count
 // against the budget (read-only introspection), so dashboards can poll it.
-async function handleMe(req: Request, env: Env): Promise<Response> {
+async function handleMe(req: Request, env: Env, rid: string): Promise<Response> {
   const key = readApiKey(req);
   let tier: Tier = 'free';
   let rateId: string;
   if (key) {
     const raw = await env.VP_SUBS.get(`${API_KEY_PREFIX}${key}`);
-    if (!raw) return Response.json({ error: 'invalid_api_key' }, { status: 401 });
+    if (!raw) {
+      structuredLog(rid, 'warn', 'me_invalid_key', { key_prefix: key.slice(0, 8) });
+      return errorBody(401, 'invalid_api_key');
+    }
     try { tier = (JSON.parse(raw) as ApiKeyRecord).tier; } catch { /* default free */ }
     rateId = `key:${hash(key)}`;
   } else {
@@ -818,38 +931,52 @@ async function handleMe(req: Request, env: Env): Promise<Response> {
 
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
+    const rid = genRid();
     const url = new URL(req.url);
     const p = url.pathname;
+    const method = req.method;
 
-    // Ungated: subscription/payment control plane + public discovery.
-    if (p === '/api/subscribe') return handleSubscribe(req, env);
-    if (p === '/api/confirm') return handleConfirm(req, env);
-    if (p === '/api/pay-status') return handlePayStatus(req, env);
-    if (p === '/api/run-now' && req.method === 'POST') return handleRunNow(req, env);
-    if (p === '/api/status') return handleStatus(req, env);
-    if (p === '/api/rails') return handleRails(req, env);
-    if (p === '/api/pricing') return handlePricing(req, env);
-    if (p === '/api/me') return handleMe(req, env);
+    structuredLog(rid, 'info', 'request_start', { method, path: p, ua: req.headers.get('user-agent')?.slice(0, 80) });
 
-    // Gated CVE-intelligence reads: resolve tier + meter the request once, then
-    // dispatch. The gate returns an early 401/429 when the key is bad or the
-    // tier's daily budget is spent.
-    const isGated = p === '/api/digest/latest' || p === '/api/digest/history'
-      || p === '/api/critical' || p === '/api/patch-now' || p.startsWith('/api/cve/');
-    if (isGated) {
-      const g = await gateRequest(req, env);
-      if ('error' in g) return g.error;
-      const a = g.access;
-      if (p === '/api/digest/latest') return handleLatest(req, env, a);
-      if (p === '/api/digest/history') return handleHistory(req, env, a);
-      if (p === '/api/critical') return handleCritical(req, env, a);
-      if (p === '/api/patch-now') return handlePatchNow(req, env, a);
-      if (p.startsWith('/api/cve/')) return handleCVE(req, env, a);
+    try {
+      // Ungated: subscription/payment control plane + public discovery.
+      if (p === '/api/subscribe') return await handleSubscribe(req, env, rid);
+      if (p === '/api/confirm') return await handleConfirm(req, env, rid);
+      if (p === '/api/pay-status') return await handlePayStatus(req, env, rid);
+      if (p === '/api/run-now' && method === 'POST') return await handleRunNow(req, env, rid);
+      if (p === '/api/status') return await handleStatus(req, env, rid);
+      if (p === '/api/rails') return await handleRails(req, env, rid);
+      if (p === '/api/pricing') return await handlePricing(req, env, rid);
+      if (p === '/api/me') return await handleMe(req, env, rid);
+
+      // Gated CVE-intelligence reads: resolve tier + meter the request once, then
+      // dispatch. The gate returns an early 401/429 when the key is bad or the
+      // tier's daily budget is spent.
+      const isGated = p === '/api/digest/latest' || p === '/api/digest/history'
+        || p === '/api/critical' || p === '/api/patch-now' || p.startsWith('/api/cve/');
+      if (isGated) {
+        const g = await gateRequest(req, env, rid);
+        if ('error' in g) return g.error;
+        const a = g.access;
+        if (p === '/api/digest/latest') return await handleLatest(req, env, a, rid);
+        if (p === '/api/digest/history') return await handleHistory(req, env, a, rid);
+        if (p === '/api/critical') return await handleCritical(req, env, a, rid);
+        if (p === '/api/patch-now') return await handlePatchNow(req, env, a, rid);
+        if (p.startsWith('/api/cve/')) return await handleCVE(req, env, a, rid);
+      }
+      return await env.ASSETS.fetch(req);
+    } catch (err) {
+      if (err instanceof HttpError) {
+        structuredLog(rid, 'warn', 'request_http_error', { method, path: p, status: err.status, code: err.code, error: err.message });
+        return errorBody(err.status, err.code, err.message, err.detail ? { detail: err.detail } : undefined);
+      }
+      structuredLog(rid, 'error', 'request_unhandled', { method, path: p, error: String(err) });
+      return errorBody(500, 'internal_error', 'An unexpected error occurred');
     }
-    return env.ASSETS.fetch(req);
   },
 
   async scheduled(_ev: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(runCron(env).then(() => undefined));
+    const rid = genRid();
+    ctx.waitUntil(runCron(env, rid).then(() => structuredLog(rid, 'info', 'cron_scheduled_completed')));
   },
 };
