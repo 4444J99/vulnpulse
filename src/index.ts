@@ -74,7 +74,17 @@ const LATEST_KEY = 'digest:latest';
 const NVD_API = 'https://services.nvd.nist.gov/rest/json/cves/2.0';
 const SUMMARY_CAP = 20; // Workers-AI free-tier mindfulness; summarize top-N per cron
 const RATE_LIMIT_KEY_PREFIX = 'rl:';
-const FREE_DAILY_API_LIMIT = 50;
+
+// === subscription gate ===
+// Every CVE-intelligence read resolves to a tier (via API key, else anonymous
+// free) and is rate-limited per tier per UTC day. Free additionally gets a
+// *limited* digest (highlights capped) and *delayed* raw CVE detail (records
+// modified <24h ago are paywalled). Pro/Team unlock full + real-time.
+type Tier = 'free' | 'pro' | 'team';
+const API_KEY_PREFIX = 'key:';
+const TIER_DAILY_API_LIMIT: Record<Tier, number> = { free: 50, pro: 5000, team: 50000 };
+const FREE_DELAY_MS = 24 * 60 * 60 * 1000; // free sees raw CVE detail 24h late
+const FREE_HIGHLIGHT_CAP = 5; // free digest endpoints return at most this many CVEs
 
 // === payrail (shared fleet money rail) ===
 // vulnpulse plugs into the live payrail Worker instead of re-implementing
@@ -364,10 +374,11 @@ function composeHeadline(raw: RawCVE[], summaries: SummarizedCVE[]): string {
 interface Sub {
   email?: string;
   webhook?: string;
-  tier: 'free' | 'pro' | 'team';
+  tier: Tier;
   filter?: { min_score?: number; classes?: string[]; tags?: string[] };
   created_at: string;
   auth_value?: string; // for paid tiers
+  api_key?: string;    // issued at subscribe (free) / confirm (paid)
 }
 
 async function handleSubscribe(req: Request, env: Env): Promise<Response> {
@@ -410,8 +421,16 @@ async function handleSubscribe(req: Request, env: Env): Promise<Response> {
       confirm_url: '/api/confirm',
     }, { status: 402 });
   }
+  const apiKey = await issueApiKey(env, 'free', hash(ident));
+  sub.api_key = apiKey;
   await env.VP_SUBS.put(`sub:${hash(ident)}`, JSON.stringify(sub));
-  return Response.json({ ok: true, tier: sub.tier, ident_hash: hash(ident).slice(0, 8) });
+  return Response.json({
+    ok: true,
+    tier: sub.tier,
+    ident_hash: hash(ident).slice(0, 8),
+    api_key: apiKey,
+    api_key_usage: 'send as "Authorization: Bearer <key>" or ?api_key=. Free tier: 50 req/day, raw CVE detail delayed 24h.',
+  });
 }
 
 function hash(s: string): string {
@@ -459,6 +478,7 @@ async function handleConfirm(req: Request, env: Env): Promise<Response> {
   }
   const receiptResp = await rr.json().catch(() => ({})) as { ok?: boolean; receipt?: unknown };
 
+  const apiKey = await issueApiKey(env, tier, hash(pending.ident));
   const active: Sub = {
     email: pending.email,
     webhook: pending.webhook,
@@ -466,10 +486,17 @@ async function handleConfirm(req: Request, env: Env): Promise<Response> {
     filter: pending.filter,
     created_at: pending.created_at,
     auth_value: body.quote_id,
+    api_key: apiKey,
   };
   await env.VP_SUBS.put(`sub:${hash(pending.ident)}`, JSON.stringify(active));
   await env.VP_SUBS.delete(`pending:${body.quote_id}`);
-  return Response.json({ ok: true, tier, receipt: receiptResp.receipt }, { status: 201 });
+  return Response.json({
+    ok: true,
+    tier,
+    api_key: apiKey,
+    api_key_usage: 'send as "Authorization: Bearer <key>". Real-time access + ' + TIER_DAILY_API_LIMIT[tier] + ' req/day.',
+    receipt: receiptResp.receipt,
+  }, { status: 201 });
 }
 
 // Poll payment status by proxying payrail's public receipt lookup.
@@ -483,20 +510,141 @@ async function handlePayStatus(req: Request, env: Env): Promise<Response> {
   return Response.json({ paid: true, receipt: await r.json() });
 }
 
+// === subscription gate (API key + tiers) ===
+
+interface ApiKeyRecord {
+  tier: Tier;
+  ident_hash: string;
+  created_at: string;
+}
+
+// Tier-prefixed opaque token: vpf_/vpp_/vpt_ + 24 random bytes hex. The prefix
+// is cosmetic (helps a human spot the tier); authority comes from the KV lookup.
+function genApiKey(tier: Tier): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(24));
+  const hex = [...bytes].map(b => b.toString(16).padStart(2, '0')).join('');
+  const prefix = tier === 'pro' ? 'vpp' : tier === 'team' ? 'vpt' : 'vpf';
+  return `${prefix}_${hex}`;
+}
+
+async function issueApiKey(env: Env, tier: Tier, identHash: string): Promise<string> {
+  const key = genApiKey(tier);
+  const rec: ApiKeyRecord = { tier, ident_hash: identHash, created_at: new Date().toISOString() };
+  await env.VP_SUBS.put(`${API_KEY_PREFIX}${key}`, JSON.stringify(rec));
+  return key;
+}
+
+// Accept the key from Authorization: Bearer, X-API-Key, or ?api_key= (in that
+// order) so it works from curl, fetch, and a browser address bar alike.
+function readApiKey(req: Request): string | null {
+  const auth = req.headers.get('authorization');
+  if (auth && /^bearer\s+/i.test(auth)) return auth.replace(/^bearer\s+/i, '').trim();
+  const x = req.headers.get('x-api-key');
+  if (x) return x.trim();
+  const q = new URL(req.url).searchParams.get('api_key');
+  return q ? q.trim() : null;
+}
+
+interface Access {
+  tier: Tier;
+  rate_id: string;
+  limit: number;
+  remaining: number;
+}
+
+function secondsUntilUtcMidnight(): number {
+  const now = new Date();
+  const next = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1);
+  return Math.max(1, Math.ceil((next - now.getTime()) / 1000));
+}
+
+function rateHeaders(a: Access): Record<string, string> {
+  return {
+    'X-RateLimit-Limit': String(a.limit),
+    'X-RateLimit-Remaining': String(Math.max(0, a.remaining)),
+    'X-VulnPulse-Tier': a.tier,
+  };
+}
+
+// Resolve tier from the key (401 on a supplied-but-unknown key), then meter one
+// request against the tier's UTC-daily budget. Returns either an early error
+// Response (401/429) or the granted Access. Counter lives in VP_CVES under the
+// existing rl: prefix; one get + one put per gated request (acceptable at this
+// product's volume — KV's 1k put/day free cap is the operative ceiling).
+async function gateRequest(req: Request, env: Env): Promise<{ access: Access } | { error: Response }> {
+  const key = readApiKey(req);
+  let tier: Tier = 'free';
+  let rateId: string;
+  if (key) {
+    const raw = await env.VP_SUBS.get(`${API_KEY_PREFIX}${key}`);
+    if (!raw) {
+      return { error: Response.json({ error: 'invalid_api_key', hint: 'subscribe at /api/subscribe to get one' }, { status: 401 }) };
+    }
+    let rec: ApiKeyRecord;
+    try { rec = JSON.parse(raw) as ApiKeyRecord; } catch {
+      return { error: Response.json({ error: 'invalid_api_key' }, { status: 401 }) };
+    }
+    tier = rec.tier === 'pro' || rec.tier === 'team' ? rec.tier : 'free';
+    rateId = `key:${hash(key)}`;
+  } else {
+    // anonymous → free, metered per source IP so one client can't drain another's
+    const ip = req.headers.get('cf-connecting-ip') ?? 'unknown';
+    rateId = `ip:${hash(ip)}`;
+  }
+
+  const limit = TIER_DAILY_API_LIMIT[tier];
+  const day = new Date().toISOString().slice(0, 10);
+  const rkey = `${RATE_LIMIT_KEY_PREFIX}api:${rateId}:${day}`;
+  const used = Number(await env.VP_CVES.get(rkey)) || 0;
+  if (used >= limit) {
+    const a: Access = { tier, rate_id: rateId, limit, remaining: 0 };
+    return { error: Response.json(
+      { error: 'rate_limited', tier, limit, retry_after_seconds: secondsUntilUtcMidnight(), upgrade: '/api/pricing' },
+      { status: 429, headers: { ...rateHeaders(a), 'Retry-After': String(secondsUntilUtcMidnight()) } },
+    ) };
+  }
+  await env.VP_CVES.put(rkey, String(used + 1), { expirationTtl: 60 * 60 * 26 });
+  return { access: { tier, rate_id: rateId, limit, remaining: limit - (used + 1) } };
+}
+
+// Free callers get a limited view: highlights are capped and a `gated` block
+// tells them what they're missing + how to lift it. Paid tiers pass through.
+function shapeDigestForTier(d: Digest, access: Access): Record<string, unknown> {
+  if (access.tier !== 'free') return d as unknown as Record<string, unknown>;
+  return {
+    ...d,
+    highlights: d.highlights.slice(0, FREE_HIGHLIGHT_CAP),
+    gated: {
+      tier: 'free',
+      highlights_shown: Math.min(FREE_HIGHLIGHT_CAP, d.highlights.length),
+      highlights_total: d.highlights.length,
+      raw_cve_detail: 'delayed 24h on /api/cve/* — Pro/Team is real-time',
+      upgrade: '/api/pricing',
+    },
+  };
+}
+
+// Free cap for the list-style endpoints (critical / patch-now).
+function capForTier<T>(items: T[], access: Access): { items: T[]; truncated: boolean } {
+  if (access.tier !== 'free' || items.length <= FREE_HIGHLIGHT_CAP) return { items, truncated: false };
+  return { items: items.slice(0, FREE_HIGHLIGHT_CAP), truncated: true };
+}
+
 // === HTTP ===
 
-async function handleLatest(_req: Request, env: Env): Promise<Response> {
+async function handleLatest(_req: Request, env: Env, access: Access): Promise<Response> {
   const v = await env.VP_DIGEST.get(LATEST_KEY);
   if (!v) {
     return Response.json({
       message: 'no digest yet — first cron run produces it within 6 hours',
       hint: 'POST /api/run-now to trigger collection (rate-limited)',
-    }, { status: 202 });
+    }, { status: 202, headers: rateHeaders(access) });
   }
-  return new Response(v, { headers: { 'Content-Type': 'application/json' } });
+  const digest = JSON.parse(v) as Digest;
+  return Response.json(shapeDigestForTier(digest, access), { headers: rateHeaders(access) });
 }
 
-async function handleHistory(_req: Request, env: Env): Promise<Response> {
+async function handleHistory(_req: Request, env: Env, access: Access): Promise<Response> {
   const list = await env.VP_DIGEST.list({ prefix: DIGEST_KEY_PREFIX, limit: 30 });
   const out: Digest[] = [];
   for (const k of list.keys) {
@@ -504,41 +652,59 @@ async function handleHistory(_req: Request, env: Env): Promise<Response> {
     const v = await env.VP_DIGEST.get(k.name);
     if (v) try { out.push(JSON.parse(v) as Digest); } catch { /* skip */ }
   }
-  return Response.json({
-    count: out.length,
-    digests: out.sort((a, b) => b.date_label.localeCompare(a.date_label)),
-  });
+  out.sort((a, b) => b.date_label.localeCompare(a.date_label));
+  const digests = access.tier === 'free' ? out.map(d => shapeDigestForTier(d, access)) : out;
+  return Response.json({ count: out.length, digests }, { headers: rateHeaders(access) });
 }
 
-async function handleCritical(_req: Request, env: Env): Promise<Response> {
+async function handleCritical(_req: Request, env: Env, access: Access): Promise<Response> {
   const v = await env.VP_DIGEST.get(LATEST_KEY);
-  if (!v) return Response.json({ critical: [] }, { status: 202 });
+  if (!v) return Response.json({ critical: [] }, { status: 202, headers: rateHeaders(access) });
   const d = JSON.parse(v) as Digest;
+  const { items, truncated } = capForTier(d.highlights.filter(h => h.severity === 'CRITICAL'), access);
   return Response.json({
     generated_at: d.generated_at,
-    critical: d.highlights.filter(h => h.severity === 'CRITICAL'),
-  });
+    critical: items,
+    ...(truncated ? { gated: { tier: 'free', limit: FREE_HIGHLIGHT_CAP, upgrade: '/api/pricing' } } : {}),
+  }, { headers: rateHeaders(access) });
 }
 
-async function handlePatchNow(_req: Request, env: Env): Promise<Response> {
+async function handlePatchNow(_req: Request, env: Env, access: Access): Promise<Response> {
   const v = await env.VP_DIGEST.get(LATEST_KEY);
-  if (!v) return Response.json({ patch_now: [] }, { status: 202 });
+  if (!v) return Response.json({ patch_now: [] }, { status: 202, headers: rateHeaders(access) });
   const d = JSON.parse(v) as Digest;
+  const { items, truncated } = capForTier(d.highlights.filter(h => h.ai_priority === 'patch_now'), access);
   return Response.json({
     generated_at: d.generated_at,
-    patch_now: d.highlights.filter(h => h.ai_priority === 'patch_now'),
-  });
+    patch_now: items,
+    ...(truncated ? { gated: { tier: 'free', limit: FREE_HIGHLIGHT_CAP, upgrade: '/api/pricing' } } : {}),
+  }, { headers: rateHeaders(access) });
 }
 
-async function handleCVE(req: Request, env: Env): Promise<Response> {
+async function handleCVE(req: Request, env: Env, access: Access): Promise<Response> {
   const url = new URL(req.url);
   const id = url.pathname.split('/').pop() ?? '';
   if (!/^CVE-\d{4}-\d{4,}$/.test(id)) {
-    return Response.json({ error: 'invalid CVE id' }, { status: 400 });
+    return Response.json({ error: 'invalid CVE id' }, { status: 400, headers: rateHeaders(access) });
   }
   const v = await env.VP_CVES.get(`${CVE_KEY_PREFIX}${id}`);
-  if (!v) return Response.json({ error: 'not_found_in_24h_window' }, { status: 404 });
-  return new Response(v, { headers: { 'Content-Type': 'application/json' } });
+  if (!v) return Response.json({ error: 'not_found_in_24h_window' }, { status: 404, headers: rateHeaders(access) });
+  const cve = JSON.parse(v) as SummarizedCVE;
+  // Free tier sees raw CVE detail on a 24h delay: a record modified in the last
+  // 24h is real-time intel and is reserved for paid tiers.
+  if (access.tier === 'free') {
+    const modAt = Date.parse(cve.modified || cve.published || '');
+    if (!Number.isNaN(modAt) && Date.now() - modAt < FREE_DELAY_MS) {
+      return Response.json({
+        error: 'gated',
+        reason: 'realtime_cve_detail',
+        detail: 'Free tier sees CVE detail 24h after last modification. This record is newer.',
+        available_at: new Date(modAt + FREE_DELAY_MS).toISOString(),
+        upgrade: '/api/pricing',
+      }, { status: 402, headers: rateHeaders(access) });
+    }
+  }
+  return Response.json(cve, { headers: rateHeaders(access) });
 }
 
 async function handleRunNow(req: Request, env: Env): Promise<Response> {
@@ -563,6 +729,13 @@ async function handleStatus(_req: Request, env: Env): Promise<Response> {
     has_latest_digest: (await env.VP_DIGEST.get(LATEST_KEY)) != null,
     sample_cve: sample,
     has_subscribers: subList.keys.length > 0,
+    subscription_gate: {
+      enabled: true,
+      tiers: TIER_DAILY_API_LIMIT,
+      free_highlight_cap: FREE_HIGHLIGHT_CAP,
+      free_cve_delay_hours: FREE_DELAY_MS / (60 * 60 * 1000),
+      pricing: '/api/pricing',
+    },
     revenue_rails: {
       crypto_active: !!env.TREASURY_WALLET,
       sponsors: 'github.com/sponsors/4444J99',
@@ -582,21 +755,97 @@ async function handleRails(_req: Request, env: Env): Promise<Response> {
   });
 }
 
+// Machine-readable pricing/tier matrix — the source of truth the README and
+// PRICING.md describe in prose. Clients can render their own upgrade UI from it.
+async function handlePricing(_req: Request, _env: Env): Promise<Response> {
+  return Response.json({
+    currency: 'USD',
+    billing: 'monthly',
+    auth: {
+      header: 'Authorization: Bearer <api_key>',
+      alternatives: ['X-API-Key: <api_key>', '?api_key=<api_key>'],
+      issued_by: 'POST /api/subscribe (free) or POST /api/confirm (paid)',
+      anonymous: 'no key → free tier, metered per IP',
+    },
+    tiers: [
+      {
+        id: 'free', price: 0, daily_api_limit: TIER_DAILY_API_LIMIT.free,
+        digest_highlights: FREE_HIGHLIGHT_CAP, raw_cve_delay_hours: 24, realtime_webhook: false,
+        includes: ['daily digest', 'email digest', `public API (${TIER_DAILY_API_LIMIT.free}/day)`, '24h-delayed raw CVE detail'],
+      },
+      {
+        id: 'pro', price: Number(TIER_PRICE.pro), daily_api_limit: TIER_DAILY_API_LIMIT.pro,
+        digest_highlights: 'full', raw_cve_delay_hours: 0, realtime_webhook: true,
+        includes: ['real-time webhook on patch_now', 'custom filters', `API (${TIER_DAILY_API_LIMIT.pro}/day)`, 'real-time raw CVE detail'],
+      },
+      {
+        id: 'team', price: Number(TIER_PRICE.team), daily_api_limit: TIER_DAILY_API_LIMIT.team,
+        digest_highlights: 'full', raw_cve_delay_hours: 0, realtime_webhook: true,
+        includes: ['everything in Pro', '5 webhooks (Slack/Teams/PagerDuty)', `API (${TIER_DAILY_API_LIMIT.team}/day)`, '5-min SLA from NVD publish'],
+      },
+    ],
+    pay: '/api/rails',
+  });
+}
+
+// Report the caller's resolved tier + today's quota usage. Does NOT count
+// against the budget (read-only introspection), so dashboards can poll it.
+async function handleMe(req: Request, env: Env): Promise<Response> {
+  const key = readApiKey(req);
+  let tier: Tier = 'free';
+  let rateId: string;
+  if (key) {
+    const raw = await env.VP_SUBS.get(`${API_KEY_PREFIX}${key}`);
+    if (!raw) return Response.json({ error: 'invalid_api_key' }, { status: 401 });
+    try { tier = (JSON.parse(raw) as ApiKeyRecord).tier; } catch { /* default free */ }
+    rateId = `key:${hash(key)}`;
+  } else {
+    const ip = req.headers.get('cf-connecting-ip') ?? 'unknown';
+    rateId = `ip:${hash(ip)}`;
+  }
+  const limit = TIER_DAILY_API_LIMIT[tier];
+  const day = new Date().toISOString().slice(0, 10);
+  const used = Number(await env.VP_CVES.get(`${RATE_LIMIT_KEY_PREFIX}api:${rateId}:${day}`)) || 0;
+  return Response.json({
+    tier,
+    authenticated: !!key,
+    daily_limit: limit,
+    used_today: used,
+    remaining_today: Math.max(0, limit - used),
+    resets_in_seconds: secondsUntilUtcMidnight(),
+  });
+}
+
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
     const p = url.pathname;
-    if (p === '/api/digest/latest') return handleLatest(req, env);
-    if (p === '/api/digest/history') return handleHistory(req, env);
-    if (p === '/api/critical') return handleCritical(req, env);
-    if (p === '/api/patch-now') return handlePatchNow(req, env);
-    if (p.startsWith('/api/cve/')) return handleCVE(req, env);
+
+    // Ungated: subscription/payment control plane + public discovery.
     if (p === '/api/subscribe') return handleSubscribe(req, env);
     if (p === '/api/confirm') return handleConfirm(req, env);
     if (p === '/api/pay-status') return handlePayStatus(req, env);
     if (p === '/api/run-now' && req.method === 'POST') return handleRunNow(req, env);
     if (p === '/api/status') return handleStatus(req, env);
     if (p === '/api/rails') return handleRails(req, env);
+    if (p === '/api/pricing') return handlePricing(req, env);
+    if (p === '/api/me') return handleMe(req, env);
+
+    // Gated CVE-intelligence reads: resolve tier + meter the request once, then
+    // dispatch. The gate returns an early 401/429 when the key is bad or the
+    // tier's daily budget is spent.
+    const isGated = p === '/api/digest/latest' || p === '/api/digest/history'
+      || p === '/api/critical' || p === '/api/patch-now' || p.startsWith('/api/cve/');
+    if (isGated) {
+      const g = await gateRequest(req, env);
+      if ('error' in g) return g.error;
+      const a = g.access;
+      if (p === '/api/digest/latest') return handleLatest(req, env, a);
+      if (p === '/api/digest/history') return handleHistory(req, env, a);
+      if (p === '/api/critical') return handleCritical(req, env, a);
+      if (p === '/api/patch-now') return handlePatchNow(req, env, a);
+      if (p.startsWith('/api/cve/')) return handleCVE(req, env, a);
+    }
     return env.ASSETS.fetch(req);
   },
 

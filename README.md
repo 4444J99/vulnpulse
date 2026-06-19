@@ -20,17 +20,36 @@ to know which CVE actually requires action *today*.
 
 ## API
 
+Gated CVE-intelligence reads (resolve a tier + count against a daily quota):
+
 ```
-GET  /api/digest/latest      — Today's full digest
+GET  /api/digest/latest      — Today's digest (free: top 5 highlights)
 GET  /api/digest/history     — Last 30 daily digests
 GET  /api/critical           — Just CVSS 9.0+ from latest digest
 GET  /api/patch-now          — Highlights flagged patch_now
-GET  /api/cve/CVE-YYYY-XXXXX — Specific CVE detail
-POST /api/subscribe          — Email or webhook subscription (JSON body)
+GET  /api/cve/CVE-YYYY-XXXXX — Specific CVE detail (free: 24h-delayed)
+```
+
+Ungated control plane & discovery (free, unmetered):
+
+```
+POST /api/subscribe          — Subscribe; returns your api_key (JSON body)
+POST /api/confirm            — Confirm a paid quote; returns your paid api_key
+GET  /api/pay-status         — Poll a payment quote
+GET  /api/pricing            — Machine-readable tier/limit matrix
+GET  /api/me                 — Your resolved tier + today's quota usage
 GET  /api/rails              — Active payment rails (crypto/sponsors/stripe/bmc)
 GET  /api/status             — System health
 POST /api/run-now            — Manual collection trigger (1/hour/IP rate limit)
 ```
+
+### Authentication
+
+Send your key as `Authorization: Bearer <key>` (or `X-API-Key:` / `?api_key=`).
+No key → anonymous **free**, metered per IP. Every gated response carries
+`X-RateLimit-Limit` / `X-RateLimit-Remaining` / `X-VulnPulse-Tier`; over-quota
+returns `429`, and a free real-time CVE lookup returns `402`. Get a key from
+`POST /api/subscribe`. Full details in [PRICING.md](./PRICING.md).
 
 ## Pricing
 
@@ -39,6 +58,8 @@ POST /api/run-now            — Manual collection trigger (1/hour/IP rate limit
 | Free  | $0             | Daily digest + email + public API (50/day) + 24h-delayed CVEs    |
 | Pro   | $29/mo         | Real-time webhook on patch_now + custom filters + API (5000/day) |
 | Team  | $99/mo         | 5 webhooks (Slack/Teams/PagerDuty) + API (50000/day) + 5-min SLA |
+
+See [PRICING.md](./PRICING.md) for the full gate spec (auth, quotas, delay rules).
 
 **Pay any rail:**
 - Crypto (USDC) — see `/api/rails`
