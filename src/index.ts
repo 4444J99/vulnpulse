@@ -175,7 +175,7 @@ async function fetchNVDRecent(env: Env, hoursBack = 24): Promise<RawCVE[]> {
   return [...dedup.values()].sort((a, b) => b.cvss_score - a.cvss_score);
 }
 
-function parseNVDResponse(data: any): RawCVE[] {
+export function parseNVDResponse(data: any): RawCVE[] {
   const vulns = data?.vulnerabilities ?? [];
   const out: RawCVE[] = [];
   for (const v of vulns) {
@@ -212,7 +212,7 @@ function parseNVDResponse(data: any): RawCVE[] {
   return out;
 }
 
-function severityFromScore(s: number): RawCVE['severity'] {
+export function severityFromScore(s: number): RawCVE['severity'] {
   if (s >= 9.0) return 'CRITICAL';
   if (s >= 7.0) return 'HIGH';
   if (s >= 4.0) return 'MEDIUM';
@@ -242,7 +242,7 @@ Rules:
 
 Return ONLY the JSON object.`;
 
-function tryParseJson(s: unknown): any | null {
+export function tryParseJson(s: unknown): any | null {
   if (s == null) return null;
   if (typeof s === 'object') return s;
   const str = typeof s === 'string' ? s : String(s);
