@@ -112,6 +112,30 @@ GET  /api/status             — System health</div>
   <p style="color:var(--muted);font-size:12px;margin-top:6px" id="sub-msg">Free tier: daily digest at 12:00 UTC. No spam, unsubscribe anytime.</p>
 </section>
 
+<section id="auth-gate">
+  <h2 id="auth-title">Dashboard</h2>
+  <div id="auth-login">
+    <p style="color:var(--muted);font-size:14px;margin-bottom:8px">Already have an API key? Log in to view your quota and access your full feed.</p>
+    <div class="subscribe-form">
+      <input id="auth-key" type="password" placeholder="vpf_... or vpp_...">
+      <button onclick="login()" id="auth-btn">Log in</button>
+    </div>
+    <p style="font-size:13px;margin-top:8px" id="auth-msg"></p>
+  </div>
+  <div id="auth-dash" style="display:none">
+    <div class="rails">
+      <div class="row"><span class="label">Tier</span><span class="val" id="dash-tier"></span><span class="status live" id="dash-badge"></span></div>
+      <div class="row"><span class="label">Daily limit</span><span class="val" id="dash-limit"></span></div>
+      <div class="row"><span class="label">Used today</span><span class="val" id="dash-used"></span></div>
+      <div class="row"><span class="label">Remaining</span><span class="val" id="dash-remaining"></span></div>
+      <div class="row"><span class="label">Resets in</span><span class="val" id="dash-resets"></span></div>
+    </div>
+    <div style="margin-top:14px;display:flex;gap:8px">
+      <button onclick="logout()" style="background:var(--border);color:var(--fg)">Log out</button>
+    </div>
+  </div>
+</section>
+
 <section id="pricing">
   <h2>Pricing</h2>
   <div class="pricing">
@@ -206,10 +230,13 @@ GET  /api/status             — System health</div>
 <script>
 async function loadLatest() {
   try {
-    const r = await fetch('/api/digest/latest');
+    const headers = {};
+    const key = localStorage.getItem('vp_api_key');
+    if (key) headers['Authorization'] = `Bearer ${key}`;
+    const r = await fetch('/api/digest/latest', { headers });
     const d = await r.json();
     if (d.error === 'rate_limited') {
-      document.getElementById('latest').innerHTML = `<em>Free tier daily limit reached (${d.limit}/day). <a href="#pricing">Upgrade</a> or come back after 00:00 UTC.</em>`;
+      document.getElementById('latest').innerHTML = `<em>Tier daily limit reached (${d.limit}/day). <a href="#pricing">Upgrade</a> or come back after 00:00 UTC.</em>`;
       document.getElementById('generated-at').textContent = '';
       return;
     }
@@ -235,10 +262,13 @@ async function loadLatest() {
 
 async function loadPatchNow() {
   try {
-    const r = await fetch('/api/patch-now');
+    const headers = {};
+    const key = localStorage.getItem('vp_api_key');
+    if (key) headers['Authorization'] = `Bearer ${key}`;
+    const r = await fetch('/api/patch-now', { headers });
     const d = await r.json();
     if (d.error === 'rate_limited') {
-      document.getElementById('patch-now-list').innerHTML = `<em style="color:var(--muted)">Free tier daily limit reached. <a href="#pricing">Upgrade</a> for more.</em>`;
+      document.getElementById('patch-now-list').innerHTML = `<em style="color:var(--muted)">Tier daily limit reached. <a href="#pricing">Upgrade</a> for more.</em>`;
       return;
     }
     const list = d.patch_now || [];
@@ -319,12 +349,78 @@ async function subscribe() {
         ? `subscribed — your API key (save it):<br><code style="word-break:break-all">${escapeHtml(d.api_key)}</code>`
         : `subscribed (${escapeHtml(d.ident_hash || '')})`;
       document.getElementById('sub-email').value = '';
+      if (d.api_key) {
+        localStorage.setItem('vp_api_key', d.api_key);
+        await loadDashboard();
+        await loadLatest();
+        await loadPatchNow();
+      }
     } else {
       msg.textContent = d.error || 'failed';
     }
   } finally {
     btn.disabled = false;
   }
+}
+
+async function login() {
+  const btn = document.getElementById('auth-btn');
+  const key = document.getElementById('auth-key').value.trim();
+  const msg = document.getElementById('auth-msg');
+  if (!key) { msg.style.color='var(--high)'; msg.textContent='enter your API key'; return; }
+  btn.disabled = true; btn.textContent = 'verifying…';
+  try {
+    const r = await fetch('/api/me', { headers: { 'Authorization': `Bearer ${key}` } });
+    const d = await r.json();
+    if (r.ok && d.authenticated) {
+      localStorage.setItem('vp_api_key', key);
+      document.getElementById('auth-key').value = '';
+      msg.textContent = '';
+      await loadDashboard();
+      await loadLatest();
+      await loadPatchNow();
+    } else {
+      msg.style.color = 'var(--high)'; msg.textContent = 'invalid API key';
+    }
+  } catch (e) {
+    msg.style.color = 'var(--high)'; msg.textContent = 'network error';
+  } finally {
+    btn.disabled = false; btn.textContent = 'Log in';
+  }
+}
+
+function logout() {
+  localStorage.removeItem('vp_api_key');
+  document.getElementById('auth-login').style.display = '';
+  document.getElementById('auth-dash').style.display = 'none';
+  document.getElementById('auth-key').value = '';
+  document.getElementById('auth-msg').textContent = '';
+  loadLatest();
+  loadPatchNow();
+}
+
+async function loadDashboard() {
+  const key = localStorage.getItem('vp_api_key');
+  if (!key) return;
+  try {
+    const r = await fetch('/api/me', { headers: { 'Authorization': `Bearer ${key}` } });
+    const d = await r.json();
+    if (r.ok && d.authenticated) {
+      document.getElementById('auth-login').style.display = 'none';
+      document.getElementById('auth-dash').style.display = '';
+      document.getElementById('dash-tier').textContent = d.tier.toUpperCase();
+      document.getElementById('dash-badge').textContent = d.tier === 'free' ? 'METERED' : 'ACTIVE';
+      document.getElementById('dash-badge').className = d.tier === 'free' ? 'status latent' : 'status live';
+      document.getElementById('dash-limit').textContent = String(d.daily_limit);
+      document.getElementById('dash-used').textContent = String(d.used_today);
+      document.getElementById('dash-remaining').textContent = String(d.remaining_today);
+      const hrs = Math.floor(d.resets_in_seconds / 3600);
+      const mins = Math.floor((d.resets_in_seconds % 3600) / 60);
+      document.getElementById('dash-resets').textContent = `${hrs}h ${mins}m`;
+    } else {
+      logout();
+    }
+  } catch (e) {}
 }
 
 let CO = { tier: null, quote_id: null, address: null, confirm_url: '/api/confirm' };
@@ -409,6 +505,7 @@ function escapeHtml(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
+loadDashboard();
 loadLatest();
 loadPatchNow();
 loadRails();
