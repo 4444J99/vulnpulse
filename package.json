@@ -8,7 +8,7 @@
   "scripts": {
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
+    "test": "node --test",
     "build": "wrangler deploy --dry-run --outdir dist"
   },
   "devDependencies": {
