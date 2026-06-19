@@ -272,7 +272,7 @@ test('gated endpoints reject bad keys and enforce the daily quota', async () => 
   assert.equal(invalidKey.status, 401);
   assert.deepEqual(await readJson(invalidKey), {
     error: 'invalid_api_key',
-    hint: 'subscribe at /api/subscribe to get one',
+    message: 'subscribe at /api/subscribe to get one',
   });
 
   const limited = await worker.fetch(
