@@ -90,14 +90,16 @@ input[type=email],input[type=url]{width:100%;background:#0a0c10;border:1px solid
 
 <section>
   <h2>API</h2>
-  <p style="color:var(--muted);font-size:14px">All endpoints are JSON. Free tier: ~50 requests / day per IP.</p>
-  <div class="code">GET  /api/digest/latest      — Today's full digest
-GET  /api/digest/history     — Last 30 daily digests
-GET  /api/critical           — Just CVSS 9.0+ from latest
-GET  /api/patch-now          — Highlights flagged patch_now
-GET  /api/cve/CVE-YYYY-XXXXX — Specific CVE detail
-POST /api/subscribe          — Email or webhook subscription
-GET  /api/rails              — Active payment rails (crypto/sponsors/stripe/bmc)
+  <p style="color:var(--muted);font-size:14px">All endpoints are JSON. The feed is <strong>gated by API key + tier</strong> — no key means anonymous <em>free</em> (50 req/day per IP, top 5 highlights, raw CVE detail delayed 24h). Authenticate with <code>Authorization: Bearer &lt;key&gt;</code> (or <code>X-API-Key</code> / <code>?api_key=</code>). Subscribe below to get a key. Full spec: <a href="/api/pricing">/api/pricing</a>.</p>
+  <div class="code">GET  /api/digest/latest      — Today's digest (free: top 5)        [gated]
+GET  /api/digest/history     — Last 30 daily digests               [gated]
+GET  /api/critical           — Just CVSS 9.0+ from latest          [gated]
+GET  /api/patch-now          — Highlights flagged patch_now        [gated]
+GET  /api/cve/CVE-YYYY-XXXXX — CVE detail (free: 24h-delayed)      [gated]
+GET  /api/me                 — Your tier + today's quota usage
+GET  /api/pricing            — Tier / limit matrix
+POST /api/subscribe          — Subscribe → returns your api_key
+GET  /api/rails              — Active payment rails
 GET  /api/status             — System health</div>
 </section>
 
@@ -110,7 +112,7 @@ GET  /api/status             — System health</div>
   <p style="color:var(--muted);font-size:12px;margin-top:6px" id="sub-msg">Free tier: daily digest at 12:00 UTC. No spam, unsubscribe anytime.</p>
 </section>
 
-<section>
+<section id="pricing">
   <h2>Pricing</h2>
   <div class="pricing">
     <div class="tier">
@@ -206,6 +208,11 @@ async function loadLatest() {
   try {
     const r = await fetch('/api/digest/latest');
     const d = await r.json();
+    if (d.error === 'rate_limited') {
+      document.getElementById('latest').innerHTML = `<em>Free tier daily limit reached (${d.limit}/day). <a href="#pricing">Upgrade</a> or come back after 00:00 UTC.</em>`;
+      document.getElementById('generated-at').textContent = '';
+      return;
+    }
     if (d.message) {
       document.getElementById('latest').innerHTML = `<em>${escapeHtml(d.message)}</em>`;
       document.getElementById('generated-at').textContent = '';
@@ -215,6 +222,9 @@ async function loadLatest() {
     html += `<div style="margin-top:10px;color:var(--muted);font-size:13px">${d.total_cves} CVE${d.total_cves===1?'':'s'} • ${d.critical_count} critical • ${d.high_count} high • ${d.patch_now_ids?.length||0} patch-now</div>`;
     for (const c of (d.highlights || []).slice(0, 8)) {
       html += renderCVE(c);
+    }
+    if (d.gated) {
+      html += `<p style="color:var(--muted);font-size:12px;margin-top:10px">Free tier: showing ${d.gated.highlights_shown} of ${d.gated.highlights_total}. <a href="#pricing">Upgrade</a> for the full real-time feed.</p>`;
     }
     document.getElementById('latest').innerHTML = html;
     document.getElementById('generated-at').textContent = `Generated ${escapeHtml(d.generated_at || '')}`;
@@ -227,6 +237,10 @@ async function loadPatchNow() {
   try {
     const r = await fetch('/api/patch-now');
     const d = await r.json();
+    if (d.error === 'rate_limited') {
+      document.getElementById('patch-now-list').innerHTML = `<em style="color:var(--muted)">Free tier daily limit reached. <a href="#pricing">Upgrade</a> for more.</em>`;
+      return;
+    }
     const list = d.patch_now || [];
     if (list.length === 0) {
       document.getElementById('patch-now-list').innerHTML = '<em style="color:var(--muted)">No patch-now flags in the last 24h. Quiet day.</em>';
@@ -300,8 +314,14 @@ async function subscribe() {
       body: JSON.stringify({ email, tier: 'free' })
     });
     const d = await r.json();
-    msg.textContent = r.ok ? `subscribed (${d.ident_hash})` : (d.error || 'failed');
-    if (r.ok) document.getElementById('sub-email').value = '';
+    if (r.ok) {
+      msg.innerHTML = d.api_key
+        ? `subscribed — your API key (save it):<br><code style="word-break:break-all">${escapeHtml(d.api_key)}</code>`
+        : `subscribed (${escapeHtml(d.ident_hash || '')})`;
+      document.getElementById('sub-email').value = '';
+    } else {
+      msg.textContent = d.error || 'failed';
+    }
   } finally {
     btn.disabled = false;
   }
