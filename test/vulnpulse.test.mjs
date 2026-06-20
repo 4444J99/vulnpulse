@@ -48,6 +48,24 @@ function hash(s) {
   return (h >>> 0).toString(16).padStart(8, '0');
 }
 
+async function hmacHex(secret, message) {
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(message));
+  return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function stripeSignature(secret, payload) {
+  const timestamp = Math.floor(Date.now() / 1000);
+  const sig = await hmacHex(secret, `${timestamp}.${payload}`);
+  return `t=${timestamp},v1=${sig}`;
+}
+
 function req(path, init = {}) {
   return new Request(`https://vulnpulse.test${path}`, init);
 }
@@ -56,7 +74,7 @@ async function readJson(response) {
   const text = await response.text();
   try {
     return JSON.parse(text);
-  } catch (err) {
+  } catch {
     assert.fail(`Expected JSON response, got: ${text}`);
   }
 }
@@ -184,6 +202,10 @@ function createEnv(options = {}) {
     USER_AGENT: 'vulnpulse-test-agent',
     TREASURY_WALLET: options.treasuryWallet,
     STRIPE_PUBLIC: options.stripePublic,
+    STRIPE_SECRET_KEY: options.stripeSecret,
+    STRIPE_WEBHOOK_SECRET: options.stripeWebhookSecret,
+    STRIPE_PRO_PRICE_ID: options.stripeProPriceId,
+    STRIPE_TEAM_PRICE_ID: options.stripeTeamPriceId,
     BMC_HANDLE: options.bmcHandle,
     SHIP_HMAC_SECRET: options.shipHmacSecret,
   };
@@ -383,6 +405,189 @@ test('subscription and payment confirmation issue API keys and persist state', a
   assert.match(payrail.calls[1].body, /0xdeadbeef/);
 });
 
+test('Stripe checkout creates a subscription session and claim issues a paid API key', async () => {
+  const originalFetch = globalThis.fetch;
+  const stripeCalls = [];
+  const email = 'buyer@example.test';
+  const sessionId = 'cs_test_vulnpulse123';
+  const subscriptionId = 'sub_vulnpulse_123';
+
+  globalThis.fetch = async (url, init = {}) => {
+    const parsed = new URL(String(url));
+    stripeCalls.push({ url: parsed, init });
+    assert.equal(parsed.hostname, 'api.stripe.com');
+    const headers = new Headers(init.headers);
+    assert.equal(headers.get('authorization'), 'Bearer sk_test_vulnpulse');
+
+    if (parsed.pathname === '/v1/checkout/sessions' && init.method === 'POST') {
+      const params = new URLSearchParams(String(init.body));
+      assert.equal(params.get('mode'), 'subscription');
+      assert.equal(params.get('customer_email'), email);
+      assert.equal(params.get('line_items[0][price]'), 'price_pro_123');
+      assert.equal(params.get('metadata[product]'), 'vulnpulse');
+      assert.equal(params.get('metadata[tier]'), 'pro');
+      assert.equal(params.get('subscription_data[metadata][tier]'), 'pro');
+      assert.match(params.get('success_url'), /session_id=\{CHECKOUT_SESSION_ID\}/);
+      return Response.json({
+        id: sessionId,
+        url: `https://checkout.stripe.test/pay/${sessionId}`,
+      });
+    }
+
+    if (parsed.pathname === `/v1/checkout/sessions/${sessionId}`) {
+      assert.equal(parsed.searchParams.get('expand[]'), 'subscription');
+      return Response.json({
+        id: sessionId,
+        status: 'complete',
+        payment_status: 'paid',
+        customer: 'cus_vulnpulse_123',
+        customer_email: email,
+        subscription: { id: subscriptionId, status: 'active' },
+        metadata: {
+          product: 'vulnpulse',
+          tier: 'pro',
+          ident_hash: hash(email),
+          email,
+        },
+      });
+    }
+
+    assert.fail(`Unexpected Stripe request: ${parsed.pathname}`);
+  };
+
+  const env = createEnv({
+    stripeSecret: 'sk_test_vulnpulse',
+    stripeProPriceId: 'price_pro_123',
+  });
+
+  try {
+    const checkoutResponse = await worker.fetch(
+      req('/api/checkout', {
+        method: 'POST',
+        body: JSON.stringify({ email, tier: 'pro' }),
+        headers: { 'content-type': 'application/json' },
+      }),
+      env,
+    );
+    const checkoutBody = await readJson(checkoutResponse);
+
+    assert.equal(checkoutResponse.status, 402);
+    assert.equal(checkoutBody.provider, 'stripe');
+    assert.equal(checkoutBody.checkout_url, `https://checkout.stripe.test/pay/${sessionId}`);
+    assert.equal(checkoutBody.session_id, sessionId);
+    assert.ok(await env.VP_SUBS.get(`pending:stripe:${sessionId}`));
+
+    const claimResponse = await worker.fetch(
+      req('/api/checkout/claim', {
+        method: 'POST',
+        body: JSON.stringify({ session_id: sessionId }),
+        headers: { 'content-type': 'application/json' },
+      }),
+      env,
+    );
+    const claimBody = await readJson(claimResponse);
+
+    assert.equal(claimResponse.status, 201);
+    assert.equal(claimBody.provider, 'stripe');
+    assert.equal(claimBody.tier, 'pro');
+    assert.match(claimBody.api_key, /^vpp_[a-f0-9]{48}$/);
+    assert.equal(await env.VP_SUBS.get(`pending:stripe:${sessionId}`), null);
+
+    const keyRecordRaw = await env.VP_SUBS.get(`key:${claimBody.api_key}`);
+    const keyRecord = JSON.parse(keyRecordRaw);
+    assert.equal(keyRecord.provider, 'stripe');
+    assert.equal(keyRecord.status, 'active');
+    assert.equal(keyRecord.stripe_subscription_id, subscriptionId);
+    assert.ok(await env.VP_SUBS.get(`stripe_sub:${subscriptionId}`));
+    assert.equal(stripeCalls.length, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Stripe webhook activates and revokes paid subscription access', async () => {
+  const secret = 'whsec_vulnpulse_test';
+  const email = 'soc-stripe@example.test';
+  const sessionId = 'cs_test_webhook123';
+  const subscriptionId = 'sub_webhook_123';
+  const env = createEnv({
+    stripeWebhookSecret: secret,
+    cves: {
+      'cve:CVE-2026-5001': JSON.stringify(cve('CVE-2026-5001', { modified: new Date().toISOString() })),
+    },
+  });
+
+  async function postStripeEvent(event) {
+    const payload = JSON.stringify(event);
+    return worker.fetch(
+      req('/api/webhooks/stripe', {
+        method: 'POST',
+        body: payload,
+        headers: {
+          'content-type': 'application/json',
+          'stripe-signature': await stripeSignature(secret, payload),
+        },
+      }),
+      env,
+    );
+  }
+
+  const completed = await postStripeEvent({
+    id: 'evt_checkout_completed',
+    type: 'checkout.session.completed',
+    data: {
+      object: {
+        id: sessionId,
+        status: 'complete',
+        payment_status: 'paid',
+        customer: 'cus_webhook_123',
+        customer_email: email,
+        subscription: subscriptionId,
+        metadata: {
+          product: 'vulnpulse',
+          tier: 'team',
+          ident_hash: hash(email),
+          email,
+        },
+      },
+    },
+  });
+  assert.equal(completed.status, 200);
+
+  const index = JSON.parse(await env.VP_SUBS.get(`stripe_session:${sessionId}`));
+  assert.match(index.api_key, /^vpt_[a-f0-9]{48}$/);
+
+  const paidDetail = await worker.fetch(
+    req('/api/cve/CVE-2026-5001', { headers: { authorization: `Bearer ${index.api_key}` } }),
+    env,
+  );
+  assert.equal(paidDetail.status, 200);
+
+  const deleted = await postStripeEvent({
+    id: 'evt_subscription_deleted',
+    type: 'customer.subscription.deleted',
+    data: { object: { id: subscriptionId, status: 'canceled' } },
+  });
+  assert.equal(deleted.status, 200);
+
+  const gatedDetail = await worker.fetch(
+    req('/api/cve/CVE-2026-5001', { headers: { authorization: `Bearer ${index.api_key}` } }),
+    env,
+  );
+  const gatedBody = await readJson(gatedDetail);
+  assert.equal(gatedDetail.status, 402);
+  assert.equal(gatedBody.error, 'subscription_inactive');
+  assert.equal(gatedBody.status, 'canceled');
+
+  const me = await worker.fetch(
+    req('/api/me', { headers: { authorization: `Bearer ${index.api_key}` } }),
+    env,
+  );
+  const meBody = await readJson(me);
+  assert.equal(meBody.active, false);
+  assert.equal(meBody.subscription_status, 'canceled');
+});
+
 test('run-now fetches NVD, summarizes high and critical CVEs, and stores the digest', async () => {
   const originalFetch = globalThis.fetch;
   const fetchCalls = [];
@@ -502,6 +707,8 @@ test('ungated discovery endpoints and asset fallback stay available', async () =
     subs: { 'sub:abc': JSON.stringify({ tier: 'free' }) },
     treasuryWallet: '0xwallet',
     stripePublic: 'pk_test',
+    stripeSecret: 'sk_test',
+    stripeProPriceId: 'price_pro',
     bmcHandle: 'vulnpulse',
   });
 
@@ -514,6 +721,8 @@ test('ungated discovery endpoints and asset fallback stay available', async () =
     crypto: '0xwallet',
     sponsors_url: 'https://github.com/sponsors/4444J99',
     stripe_active: true,
+    stripe_checkout: '/api/checkout',
+    stripe_claim: '/api/checkout/claim',
     bmc_url: 'https://www.buymeacoffee.com/vulnpulse',
   });
 
