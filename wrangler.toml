@@ -33,13 +33,6 @@ id = "9077c2dbbea2465fb30324d0d02332a7"
 USER_AGENT = "Mozilla/5.0 (compatible; VulnPulse/0.1; +https://vulnpulse.ivixivi.workers.dev)"
 # Shared fleet money rail (public-hostname fallback; SHIP_HMAC_SECRET stays a wrangler secret, unset).
 PAYRAIL_URL = "https://payrail.ivixivi.workers.dev"
-# Stripe Checkout activates when STRIPE_SECRET_KEY plus at least one tier price
-# ID are set as secrets:
-#   wrangler secret put STRIPE_SECRET_KEY
-#   wrangler secret put STRIPE_WEBHOOK_SECRET
-#   wrangler secret put STRIPE_PRO_PRICE_ID
-#   wrangler secret put STRIPE_TEAM_PRICE_ID
-# Webhook endpoint: /api/webhooks/stripe
 
 # Service binding to the payrail Worker — the PREFERRED rail path. An internal
 # worker→worker call that never hits the public edge, so it sidesteps both the
