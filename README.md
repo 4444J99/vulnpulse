@@ -1,100 +1,359 @@
 # VulnPulse
 
-> Defender-side CVE feed. Patch what matters, ignore the rest.
+> Defender-side CVE intelligence. Patch what matters, ignore the rest.
 
 **Live:** https://vulnpulse.ivixivi.workers.dev
 
-VulnPulse polls the NVD JSON 2.0 feed every 6 hours for high+critical CVEs (CVSS ≥ 7.0)
-modified in the last 24h, AI-summarizes each one for impact + mitigation priority, and
-serves a free daily digest plus paid real-time webhooks for security teams that need
-to know which CVE actually requires action *today*.
+VulnPulse turns the NVD CVE firehose into a short, defender-focused feed. It
+pulls high and critical CVEs (CVSS >= 7.0) from the NVD JSON 2.0 API, runs the
+top findings through Cloudflare Workers AI, and stores a daily digest with
+plain-English impact, mitigation guidance, exploitability, tags, and a
+`patch_now` priority flag.
 
-## What you get
+The hosted service is useful without an account: anonymous callers get the free
+tier, metered by IP. API keys unlock quota tracking by account, and paid tiers
+unlock the full real-time feed, raw CVE detail without the free-tier delay, and
+webhook-oriented workflows.
 
-- **Daily digest** — top high+critical CVEs from the last 24h, AI-summarized
-- **patch_now flag** — automated triage: which ones a defender actually needs to act on this week
-- **Plain-English impact** — what an attacker gets, auth required, network reachable
-- **Mitigation guidance** — patch version, config change, or workaround
-- **Tag classification** — web, auth, rce, ssrf, deserialize, supply-chain, container, cloud, iot, …
-- **Class breakdown** — web-app, network-stack, os-kernel, browser, library, sdk, cms, …
+## What It Is
 
-## API
+VulnPulse is a Cloudflare Worker with three jobs:
 
-Gated CVE-intelligence reads (resolve a tier + count against a daily quota):
+- **Collect** - scheduled Worker cron fetches recently modified high and
+  critical CVEs from NVD. The deployed cron runs daily at 12:00 UTC and fetches
+  the last 24 hours.
+- **Summarize** - Workers AI summarizes the highest-priority CVEs for impact,
+  likely exploitability, mitigation, tags, and product class.
+- **Gate and serve** - JSON endpoints expose the latest digest, digest history,
+  critical-only views, patch-now views, and individual CVE detail under a
+  tiered API key model.
 
+The output is intentionally operational. Instead of asking an engineer to read
+every NVD entry, VulnPulse answers:
+
+- What does an attacker get?
+- Is this remotely reachable or auth-gated?
+- Is there enough signal to patch this week?
+- Is there a mitigation or only a vendor patch?
+- Which class of system is affected: web app, library, cloud, container,
+  browser, IoT, kernel, and so on?
+
+## Who Pays
+
+VulnPulse is built for teams that already care about CVEs but do not want to
+triage the full NVD stream manually.
+
+- **Free users** are individual defenders, founders, students, and small teams
+  who want a daily pulse and a small public API budget.
+- **Pro buyers** are security engineers, platform teams, SREs, and startup
+  operators who need real-time raw CVE detail, full digests, higher API limits,
+  and `patch_now` automation.
+- **Team buyers** are SOCs, MSSPs, platform/security teams, and product security
+  groups that need multiple webhook destinations, larger quotas, and an
+  operational SLA.
+
+The commercial hook is time saved during patch triage. Free gives enough signal
+to trust the feed; paid unlocks the parts teams wire into Slack, Teams,
+PagerDuty, internal dashboards, and patch-management workflows.
+
+## Install
+
+### Use The Hosted API
+
+You can use the hosted API immediately:
+
+```sh
+curl https://vulnpulse.ivixivi.workers.dev/api/digest/latest
 ```
-GET  /api/digest/latest      — Today's digest (free: top 5 highlights)
-GET  /api/digest/history     — Last 30 daily digests
-GET  /api/critical           — Just CVSS 9.0+ from latest digest
-GET  /api/patch-now          — Highlights flagged patch_now
-GET  /api/cve/CVE-YYYY-XXXXX — Specific CVE detail (free: 24h-delayed)
+
+No key means anonymous free tier. To get a free API key:
+
+```sh
+curl -sS https://vulnpulse.ivixivi.workers.dev/api/subscribe \
+  -H 'content-type: application/json' \
+  -d '{"email":"you@example.com"}'
 ```
 
-Ungated control plane & discovery (free, unmetered):
+Send the returned key as `Authorization: Bearer <api_key>`.
 
+### Run Your Own Worker
+
+Prerequisites:
+
+- Node.js 20+
+- npm
+- A Cloudflare account with Workers, Workers AI, Workers KV, and Wrangler access
+
+Clone and install:
+
+```sh
+git clone https://github.com/4444J99/vulnpulse.git
+cd vulnpulse
+npm install
 ```
-POST /api/subscribe          — Subscribe; returns your api_key (JSON body)
-POST /api/confirm            — Confirm a paid quote; returns your paid api_key
-GET  /api/pay-status         — Poll a payment quote
-GET  /api/pricing            — Machine-readable tier/limit matrix
-GET  /api/me                 — Your resolved tier + today's quota usage
-GET  /api/rails              — Active payment rails (crypto/sponsors/stripe/bmc)
-GET  /api/status             — System health
-POST /api/run-now            — Manual collection trigger (1/hour/IP rate limit)
+
+Create the KV namespaces if you are deploying your own copy:
+
+```sh
+npx wrangler kv namespace create VP_CVES
+npx wrangler kv namespace create VP_DIGEST
+npx wrangler kv namespace create VP_SUBS
 ```
+
+Put the generated namespace IDs into `wrangler.toml`.
+
+Required binding/config:
+
+- `AI` - Cloudflare Workers AI binding
+- `ASSETS` - static asset binding for `public/`
+- `VP_CVES` - CVE records and rate counters
+- `VP_DIGEST` - latest and historical digest records
+- `VP_SUBS` - subscriptions, pending quotes, and API key records
+- `USER_AGENT` - NVD-friendly user agent string
+- `PAYRAIL` service binding or `PAYRAIL_URL` - paid checkout/receipt rail
+
+Optional monetization settings:
+
+```sh
+npx wrangler secret put TREASURY_WALLET
+npx wrangler secret put SHIP_HMAC_SECRET
+npx wrangler secret put STRIPE_PUBLIC
+npx wrangler secret put BMC_HANDLE
+```
+
+Run checks:
+
+```sh
+npm test
+npm run typecheck
+npm run build
+```
+
+Run locally:
+
+```sh
+npx wrangler dev
+```
+
+Deploy:
+
+```sh
+npx wrangler deploy
+```
+
+## Usage
+
+All API responses are JSON.
 
 ### Authentication
 
-Send your key as `Authorization: Bearer <key>` (or `X-API-Key:` / `?api_key=`).
-No key → anonymous **free**, metered per IP. Every gated response carries
-`X-RateLimit-Limit` / `X-RateLimit-Remaining` / `X-VulnPulse-Tier`; over-quota
-returns `429`, and a free real-time CVE lookup returns `402`. Get a key from
-`POST /api/subscribe`. Full details in [PRICING.md](./PRICING.md).
+Keys can be supplied three ways:
 
-## Pricing
+```http
+Authorization: Bearer <api_key>
+X-API-Key: <api_key>
+?api_key=<api_key>
+```
 
-| Tier  | Price          | What's included                                                   |
-|-------|----------------|-------------------------------------------------------------------|
-| Free  | $0             | Daily digest + email + public API (50/day) + 24h-delayed CVEs    |
-| Pro   | $29/mo         | Real-time webhook on patch_now + custom filters + API (5000/day) |
-| Team  | $99/mo         | 5 webhooks (Slack/Teams/PagerDuty) + API (50000/day) + 5-min SLA |
+No key resolves to anonymous **free** tier, metered by source IP. A bad key
+returns `401 invalid_api_key`; it does not silently downgrade to free.
 
-See [PRICING.md](./PRICING.md) for the full gate spec (auth, quotas, delay rules).
+Gated responses include quota headers:
 
-**Pay any rail:**
-- Crypto (USDC) — see `/api/rails`
-- GitHub Sponsors — https://github.com/sponsors/4444J99
-- Buy Me a Coffee — see `/api/rails`
-- Stripe Checkout — activating
+```http
+X-RateLimit-Limit: 50
+X-RateLimit-Remaining: 49
+X-VulnPulse-Tier: free
+```
+
+When the daily budget is spent, the API returns `429 rate_limited` with
+`Retry-After` seconds until the next UTC reset.
+
+### Common Calls
+
+Get the latest digest:
+
+```sh
+curl -sS https://vulnpulse.ivixivi.workers.dev/api/digest/latest \
+  -H "Authorization: Bearer $VULNPULSE_API_KEY"
+```
+
+Get only CVSS 9.0+ records from the latest digest:
+
+```sh
+curl -sS https://vulnpulse.ivixivi.workers.dev/api/critical \
+  -H "Authorization: Bearer $VULNPULSE_API_KEY"
+```
+
+Get the current `patch_now` list:
+
+```sh
+curl -sS https://vulnpulse.ivixivi.workers.dev/api/patch-now \
+  -H "Authorization: Bearer $VULNPULSE_API_KEY"
+```
+
+Fetch a specific CVE:
+
+```sh
+curl -sS https://vulnpulse.ivixivi.workers.dev/api/cve/CVE-2026-12345 \
+  -H "Authorization: Bearer $VULNPULSE_API_KEY"
+```
+
+Check your resolved tier and quota usage without spending quota:
+
+```sh
+curl -sS https://vulnpulse.ivixivi.workers.dev/api/me \
+  -H "Authorization: Bearer $VULNPULSE_API_KEY"
+```
+
+Trigger a manual collection run:
+
+```sh
+curl -sS -X POST https://vulnpulse.ivixivi.workers.dev/api/run-now
+```
+
+`/api/run-now` is separately rate-limited to one request per hour per IP.
+
+## API Reference
+
+Gated CVE-intelligence endpoints resolve a tier and count against the caller's
+daily quota:
+
+```http
+GET /api/digest/latest
+GET /api/digest/history
+GET /api/critical
+GET /api/patch-now
+GET /api/cve/CVE-YYYY-XXXXX
+```
+
+Control-plane and discovery endpoints are not counted against the CVE
+intelligence quota:
+
+```http
+POST /api/subscribe
+POST /api/confirm
+GET  /api/pay-status
+GET  /api/pricing
+GET  /api/me
+GET  /api/rails
+GET  /api/status
+POST /api/run-now
+```
+
+## Pricing And Monetization
+
+The source of truth for the current tier matrix is the machine-readable
+`GET /api/pricing` endpoint. The prose below mirrors the implemented product
+model.
+
+| Tier | Price | Daily API quota | Digest | Raw CVE detail | Commercial use case |
+| --- | ---: | ---: | --- | --- | --- |
+| Free | $0 | 50/day | Top 5 highlights | 24h delayed | Try the feed, daily pulse, light scripts |
+| Pro | $29/mo | 5,000/day | Full | Real-time | Patch triage automation for one team |
+| Team | $99/mo | 50,000/day | Full | Real-time | SOC/platform workflows with multiple destinations |
+
+Tier entitlements:
+
+- **Free** - daily digest, email digest, public API, top-five highlights on
+  digest/list endpoints, and raw CVE detail delayed by 24 hours.
+- **Pro** - full digest, real-time raw CVE detail, custom filters, real-time
+  `patch_now` webhook entitlement, and 5,000 API calls per day.
+- **Team** - everything in Pro, five webhook destinations
+  (Slack/Teams/PagerDuty-style workflows), 50,000 API calls per day, and a
+  5-minute SLA target from NVD publish.
+
+Paid checkout flow:
+
+1. Start a paid quote:
+
+   ```sh
+   curl -i https://vulnpulse.ivixivi.workers.dev/api/subscribe \
+     -H 'content-type: application/json' \
+     -d '{"email":"sec@example.com","tier":"pro"}'
+   ```
+
+2. The API returns `402 payment_required` with a `quote_id`, USDC payment
+   details, instructions, and `confirm_url`.
+3. Pay through the returned rail, then confirm:
+
+   ```sh
+   curl -sS https://vulnpulse.ivixivi.workers.dev/api/confirm \
+     -H 'content-type: application/json' \
+     -d '{"quote_id":"quote_pro_123","tx_hash":"0x..."}'
+   ```
+
+4. The success response returns a paid API key.
+
+Payment/discovery rails:
+
+- **USDC crypto checkout** - live through the payrail quote/receipt flow.
+- **GitHub Sponsors** - https://github.com/sponsors/4444J99
+- **Buy Me a Coffee** - exposed when `BMC_HANDLE` is configured.
+- **Stripe Checkout** - exposed as active when `STRIPE_PUBLIC` is configured.
+
+Clients should read `GET /api/rails` and `GET /api/pricing` instead of
+hard-coding payment availability or tier metadata.
+
+Full gate details live in [PRICING.md](./PRICING.md).
+
+## Data Model
+
+Each summarized CVE keeps the NVD basics plus AI triage fields:
+
+```json
+{
+  "id": "CVE-2026-12345",
+  "published": "2026-06-18T00:00:00.000Z",
+  "modified": "2026-06-18T12:00:00.000Z",
+  "cvss_score": 9.8,
+  "severity": "CRITICAL",
+  "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+  "description": "...",
+  "references": ["https://example.com/advisory"],
+  "cwe_ids": ["CWE-79"],
+  "ai_impact": "...",
+  "ai_mitigation": "...",
+  "ai_exploitability": "poc_likely",
+  "ai_priority": "patch_now",
+  "ai_tags": ["rce", "web"],
+  "ai_class": "web-app"
+}
+```
 
 ## Stack
 
-- Cloudflare Workers (compute + cron)
-- Cloudflare Workers AI — Llama 3.3 70B for CVE summarization
-- Cloudflare KV — CVE storage, daily digest archive, subscription list
-- NVD JSON 2.0 API — public CVE source
+- Cloudflare Workers for HTTP, cron, and deployment
+- Cloudflare Workers AI for CVE summarization
+- Cloudflare Workers KV for CVEs, digests, subscriptions, and API counters
+- Cloudflare static assets for the hosted page in `public/`
+- NVD JSON 2.0 API as the public CVE source
+- Payrail service binding for quote and receipt handling
 
 ## Development
 
-Run the automated test suite with:
+Useful commands:
 
+```sh
+npm test          # vitest + node:test Worker tests
+npm run lint     # eslint
+npm run typecheck
+npm run build    # wrangler dry-run deploy build
 ```
-npm test
-```
 
-The tests use Node's built-in test runner with in-memory Worker bindings, so they
-do not need live Cloudflare services.
+The tests use in-memory Worker bindings and do not require live Cloudflare
+services.
 
-## Sister products
+## Sister Products
 
 VulnPulse is part of an intelligence portfolio:
 
-- [PromptScope](https://promptscope.ivixivi.workers.dev) — LLM system-prompt analyzer
-- [EdgarFlash](https://edgarflash.ivixivi.workers.dev) — Real-time SEC EDGAR alerts
-- [WriteLens](https://writelens.ivixivi.workers.dev) — Pay-per-call text quality scoring
-- [BountyScope](https://bountyscope.ivixivi.workers.dev) — Bug-bounty intel + smart-contract analyzer
-- [TrendPulse](https://trendpulse.ivixivi.workers.dev) — Daily emerging-tech digest
+- [PromptScope](https://promptscope.ivixivi.workers.dev) - LLM system-prompt analyzer
+- [EdgarFlash](https://edgarflash.ivixivi.workers.dev) - Real-time SEC EDGAR alerts
+- [WriteLens](https://writelens.ivixivi.workers.dev) - Pay-per-call text quality scoring
+- [BountyScope](https://bountyscope.ivixivi.workers.dev) - Bug-bounty intel + smart-contract analyzer
+- [TrendPulse](https://trendpulse.ivixivi.workers.dev) - Daily emerging-tech digest
 
 ## License
 
-MIT — see [LICENSE](./LICENSE).
+MIT - see [LICENSE](./LICENSE).
