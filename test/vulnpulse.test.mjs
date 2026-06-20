@@ -48,6 +48,18 @@ function hash(s) {
   return (h >>> 0).toString(16).padStart(8, '0');
 }
 
+async function hmacHex(secret, message) {
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(message));
+  return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
 function req(path, init = {}) {
   return new Request(`https://vulnpulse.test${path}`, init);
 }
@@ -258,6 +270,84 @@ test('free and paid latest digest responses are tier-shaped and metered', async 
   assert.equal(paidBody.gated, undefined);
 });
 
+test('history, critical, and patch-now endpoints cap free results and keep paid results complete', async () => {
+  const latestDigest = digestFixture(12);
+  const olderDigest = {
+    ...digestFixture(8),
+    generated_at: '2026-06-18T00:00:00.000Z',
+    date_label: '2026-06-18',
+  };
+  const env = createEnv({
+    digests: {
+      [LATEST_KEY]: JSON.stringify(latestDigest),
+      'digest:2026-06-18': JSON.stringify(olderDigest),
+      'digest:2026-06-19': JSON.stringify(latestDigest),
+      'digest:broken': '{',
+    },
+    subs: { 'key:vpt_history_key': keyRecord('team') },
+  });
+
+  const freeHistory = await worker.fetch(
+    req('/api/digest/history', { headers: { 'cf-connecting-ip': '203.0.113.30' } }),
+    env,
+  );
+  const freeHistoryBody = await readJson(freeHistory);
+
+  assert.equal(freeHistory.status, 200);
+  assert.equal(freeHistory.headers.get('X-VulnPulse-Tier'), 'free');
+  assert.equal(freeHistoryBody.count, 2);
+  assert.deepEqual(freeHistoryBody.digests.map((d) => d.date_label), ['2026-06-19', '2026-06-18']);
+  assert.equal(freeHistoryBody.digests[0].highlights.length, 5);
+  assert.equal(freeHistoryBody.digests[0].gated.highlights_total, 12);
+
+  const paidHistory = await worker.fetch(
+    req('/api/digest/history', { headers: { authorization: 'Bearer vpt_history_key' } }),
+    env,
+  );
+  const paidHistoryBody = await readJson(paidHistory);
+
+  assert.equal(paidHistory.status, 200);
+  assert.equal(paidHistory.headers.get('X-VulnPulse-Tier'), 'team');
+  assert.equal(paidHistoryBody.digests[0].highlights.length, 12);
+  assert.equal(paidHistoryBody.digests[0].gated, undefined);
+
+  const freeCritical = await worker.fetch(
+    req('/api/critical', { headers: { 'cf-connecting-ip': '203.0.113.31' } }),
+    env,
+  );
+  const freeCriticalBody = await readJson(freeCritical);
+  assert.equal(freeCritical.status, 200);
+  assert.equal(freeCriticalBody.critical.length, 5);
+  assert.deepEqual(freeCriticalBody.gated, { tier: 'free', limit: 5, upgrade: '/api/pricing' });
+
+  const paidCritical = await worker.fetch(
+    req('/api/critical', { headers: { 'x-api-key': 'vpt_history_key' } }),
+    env,
+  );
+  const paidCriticalBody = await readJson(paidCritical);
+  assert.equal(paidCritical.status, 200);
+  assert.equal(paidCriticalBody.critical.length, 6);
+  assert.equal(paidCriticalBody.gated, undefined);
+
+  const freePatchNow = await worker.fetch(
+    req('/api/patch-now', { headers: { 'cf-connecting-ip': '203.0.113.32' } }),
+    env,
+  );
+  const freePatchNowBody = await readJson(freePatchNow);
+  assert.equal(freePatchNow.status, 200);
+  assert.equal(freePatchNowBody.patch_now.length, 5);
+  assert.deepEqual(freePatchNowBody.gated, { tier: 'free', limit: 5, upgrade: '/api/pricing' });
+
+  const paidPatchNow = await worker.fetch(
+    req('/api/patch-now', { headers: { authorization: 'Bearer vpt_history_key' } }),
+    env,
+  );
+  const paidPatchNowBody = await readJson(paidPatchNow);
+  assert.equal(paidPatchNow.status, 200);
+  assert.equal(paidPatchNowBody.patch_now.length, 6);
+  assert.equal(paidPatchNowBody.gated, undefined);
+});
+
 test('gated endpoints reject bad keys and enforce the daily quota', async () => {
   const ip = '198.51.100.25';
   const today = new Date().toISOString().slice(0, 10);
@@ -287,6 +377,64 @@ test('gated endpoints reject bad keys and enforce the daily quota', async () => 
   assert.equal(limitedBody.error, 'rate_limited');
   assert.equal(limitedBody.limit, 50);
   assert.ok(Number(limited.headers.get('Retry-After')) > 0);
+});
+
+test('payment status and account introspection report quote and quota state', async () => {
+  const payrail = createPayrail();
+  const teamKey = 'vpt_me_key';
+  const ip = '203.0.113.70';
+  const today = new Date().toISOString().slice(0, 10);
+  const env = createEnv({
+    payrail,
+    cves: {
+      [`rl:api:key:${hash(teamKey)}:${today}`]: '17',
+      [`rl:api:ip:${hash(ip)}:${today}`]: '2',
+    },
+    subs: { [`key:${teamKey}`]: keyRecord('team') },
+  });
+
+  const missingQuote = await worker.fetch(req('/api/pay-status'), env);
+  assert.equal(missingQuote.status, 400);
+  assert.equal((await readJson(missingQuote)).error, 'validation_error');
+
+  const unpaid = await worker.fetch(req('/api/pay-status?quote_id=missing_quote'), env);
+  assert.equal(unpaid.status, 200);
+  assert.deepEqual(await readJson(unpaid), { paid: false, quote_id: 'missing_quote' });
+
+  const paid = await worker.fetch(req('/api/pay-status?quote_id=quote_pro_123'), env);
+  assert.equal(paid.status, 200);
+  assert.deepEqual(await readJson(paid), { paid: true, receipt: { id: 'receipt_123' } });
+  assert.deepEqual(payrail.calls.map((call) => call.url.pathname), [
+    '/receipt/missing_quote',
+    '/receipt/quote_pro_123',
+  ]);
+
+  const authedMe = await worker.fetch(
+    req('/api/me', { headers: { 'x-api-key': teamKey } }),
+    env,
+  );
+  const authedMeBody = await readJson(authedMe);
+  assert.equal(authedMe.status, 200);
+  assert.equal(authedMeBody.tier, 'team');
+  assert.equal(authedMeBody.authenticated, true);
+  assert.equal(authedMeBody.used_today, 17);
+  assert.equal(authedMeBody.remaining_today, 49983);
+  assert.ok(authedMeBody.resets_in_seconds > 0);
+
+  const anonMe = await worker.fetch(
+    req('/api/me', { headers: { 'cf-connecting-ip': ip } }),
+    env,
+  );
+  const anonMeBody = await readJson(anonMe);
+  assert.equal(anonMe.status, 200);
+  assert.equal(anonMeBody.tier, 'free');
+  assert.equal(anonMeBody.authenticated, false);
+  assert.equal(anonMeBody.used_today, 2);
+  assert.equal(anonMeBody.remaining_today, 48);
+
+  const invalidMe = await worker.fetch(req('/api/me?api_key=missing_key'), env);
+  assert.equal(invalidMe.status, 401);
+  assert.equal((await readJson(invalidMe)).error, 'invalid_api_key');
 });
 
 test('CVE detail applies the free 24 hour delay while paid keys get real-time data', async () => {
@@ -324,6 +472,98 @@ test('CVE detail applies the free 24 hour delay while paid keys get real-time da
   );
   assert.equal(paidResponse.status, 200);
   assert.equal((await readJson(paidResponse)).id, 'CVE-2026-2001');
+});
+
+test('subscription and confirmation validation failures return typed errors', async () => {
+  const env = createEnv();
+
+  const subscribeGet = await worker.fetch(req('/api/subscribe'), env);
+  assert.equal(subscribeGet.status, 405);
+  assert.deepEqual(await readJson(subscribeGet), {
+    error: 'method_not_allowed',
+    message: 'POST only',
+  });
+
+  const wrongType = await worker.fetch(
+    req('/api/subscribe', { method: 'POST', body: '{}' }),
+    env,
+  );
+  assert.equal(wrongType.status, 415);
+  assert.equal((await readJson(wrongType)).error, 'unsupported_media_type');
+
+  const badJson = await worker.fetch(
+    req('/api/subscribe', {
+      method: 'POST',
+      body: '{',
+      headers: { 'content-type': 'application/json' },
+    }),
+    env,
+  );
+  assert.equal(badJson.status, 400);
+  assert.deepEqual(await readJson(badJson), {
+    error: 'invalid_json',
+    message: 'Request body must be valid JSON',
+  });
+
+  const invalidEmail = await worker.fetch(
+    req('/api/subscribe', {
+      method: 'POST',
+      body: JSON.stringify({ email: 'not-an-email' }),
+      headers: { 'content-type': 'application/json' },
+    }),
+    env,
+  );
+  assert.equal(invalidEmail.status, 400);
+  assert.deepEqual(await readJson(invalidEmail), {
+    error: 'validation_error',
+    message: 'invalid email format',
+  });
+
+  const invalidWebhook = await worker.fetch(
+    req('/api/subscribe', {
+      method: 'POST',
+      body: JSON.stringify({ webhook: 'ftp://example.test/hook' }),
+      headers: { 'content-type': 'application/json' },
+    }),
+    env,
+  );
+  assert.equal(invalidWebhook.status, 400);
+  assert.deepEqual(await readJson(invalidWebhook), {
+    error: 'validation_error',
+    message: 'invalid webhook URL',
+  });
+
+  const confirmGet = await worker.fetch(req('/api/confirm'), env);
+  assert.equal(confirmGet.status, 405);
+  assert.deepEqual(await readJson(confirmGet), {
+    error: 'method_not_allowed',
+    message: 'POST only',
+  });
+
+  const confirmMissingFields = await worker.fetch(
+    req('/api/confirm', {
+      method: 'POST',
+      body: JSON.stringify({ quote_id: 'quote_only' }),
+      headers: { 'content-type': 'application/json' },
+    }),
+    env,
+  );
+  assert.equal(confirmMissingFields.status, 400);
+  assert.deepEqual(await readJson(confirmMissingFields), {
+    error: 'validation_error',
+    message: 'quote_id and tx_hash required (strings)',
+  });
+
+  const confirmUnknownQuote = await worker.fetch(
+    req('/api/confirm', {
+      method: 'POST',
+      body: JSON.stringify({ quote_id: 'missing_quote', tx_hash: '0xabc' }),
+      headers: { 'content-type': 'application/json' },
+    }),
+    env,
+  );
+  assert.equal(confirmUnknownQuote.status, 404);
+  assert.deepEqual(await readJson(confirmUnknownQuote), { error: 'quote_not_found_or_expired' });
 });
 
 test('subscription and payment confirmation issue API keys and persist state', async () => {
@@ -381,6 +621,55 @@ test('subscription and payment confirmation issue API keys and persist state', a
   assert.ok(await env.VP_SUBS.get(`key:${confirmBody.api_key}`));
   assert.equal(payrail.calls[1].url.pathname, '/receipt');
   assert.match(payrail.calls[1].body, /0xdeadbeef/);
+});
+
+test('paid confirmation signs payrail receipts when a shared secret is configured', async () => {
+  const payrail = createPayrail();
+  const env = createEnv({
+    payrail,
+    shipHmacSecret: 'shared-secret',
+    subs: {
+      'pending:quote_pro_123': JSON.stringify({
+        email: 'signed@example.test',
+        tier: 'team',
+        filter: { min_score: 8 },
+        created_at: '2026-06-19T00:00:00.000Z',
+        ident: 'signed@example.test',
+        quote_id: 'quote_pro_123',
+      }),
+    },
+  });
+
+  const confirmResponse = await worker.fetch(
+    req('/api/confirm', {
+      method: 'POST',
+      body: JSON.stringify({ quote_id: 'quote_pro_123', tx_hash: '0xsigned' }),
+      headers: { 'content-type': 'application/json' },
+    }),
+    env,
+  );
+  const confirmBody = await readJson(confirmResponse);
+
+  assert.equal(confirmResponse.status, 201);
+  assert.equal(confirmBody.tier, 'team');
+  assert.match(confirmBody.api_key, /^vpt_[a-f0-9]{48}$/);
+  assert.deepEqual(confirmBody.receipt, { id: 'receipt_123' });
+  assert.equal(await env.VP_SUBS.get('pending:quote_pro_123'), null);
+
+  const active = JSON.parse(await env.VP_SUBS.get(`sub:${hash('signed@example.test')}`));
+  assert.equal(active.tier, 'team');
+  assert.equal(active.auth_value, 'quote_pro_123');
+  assert.equal(active.api_key, confirmBody.api_key);
+
+  const receiptCall = payrail.calls[0];
+  assert.equal(receiptCall.url.pathname, '/receipt');
+  assert.equal(receiptCall.headers.get('content-type'), 'application/json');
+  assert.equal(
+    receiptCall.headers.get('x-payrail-signature'),
+    await hmacHex('shared-secret', receiptCall.body),
+  );
+  assert.match(receiptCall.body, /"sku":"vulnpulse:team"/);
+  assert.match(receiptCall.body, /"tx_hash":"0xsigned"/);
 });
 
 test('run-now fetches NVD, summarizes high and critical CVEs, and stores the digest', async () => {
