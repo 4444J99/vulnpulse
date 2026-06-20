@@ -159,7 +159,7 @@ GET  /api/status             — System health</div>
         <li>Filter by CWE / tag</li>
         <li>API: 5000/day</li>
       </ul>
-      <button onclick="upgrade('pro')" style="margin-top:12px;width:100%">Upgrade with checkout</button>
+      <button onclick="upgrade('pro')" style="margin-top:12px;width:100%">Upgrade — pay with USDC</button>
     </div>
     <div class="tier">
       <h3>Team</h3>
@@ -171,17 +171,17 @@ GET  /api/status             — System health</div>
         <li>Custom CVE-watch list</li>
         <li>SLA: 5-min from NVD publish</li>
       </ul>
-      <button onclick="upgrade('team')" style="margin-top:12px;width:100%">Upgrade with checkout</button>
+      <button onclick="upgrade('team')" style="margin-top:12px;width:100%">Upgrade — pay with USDC</button>
     </div>
   </div>
 </section>
 
 <section id="checkout" style="display:none">
   <h2 id="checkout-title">Upgrade</h2>
-  <p style="color:var(--muted);font-size:13px" id="checkout-sub">Start secure checkout with your email. If card checkout is active, you'll go to Stripe and return here for your API key; otherwise you'll get a USDC quote and confirmation form.</p>
+  <p style="color:var(--muted);font-size:13px" id="checkout-sub">Pay once with USDC on Base. You'll get an address and a unique memo — send, then paste your transaction hash to unlock instantly. No card, no account.</p>
   <div class="subscribe-form">
     <input id="co-email" type="email" placeholder="you@company.com">
-    <button onclick="startCheckout()" id="co-btn">Start checkout</button>
+    <button onclick="startCheckout()" id="co-btn">Get payment details</button>
   </div>
   <div id="co-quote" style="display:none;margin-top:14px">
     <div class="rails">
@@ -201,12 +201,12 @@ GET  /api/status             — System health</div>
 
 <section>
   <h2>Pay any way</h2>
-  <p style="color:var(--muted);font-size:14px;margin-bottom:8px">VulnPulse takes payment through multiple rails so you can pay how you want, on any clock. Stripe Checkout is used when configured; USDC remains available as fallback.</p>
+  <p style="color:var(--muted);font-size:14px;margin-bottom:8px">VulnPulse takes payment through multiple rails so you can pay how you want, on any clock. Card payments are activating; the others are live.</p>
   <div id="rails" class="rails">
     <div class="row"><span class="label">Crypto (USDC)</span><span class="val" id="rail-crypto">loading…</span></div>
     <div class="row"><span class="label">GitHub Sponsors</span><span class="val"><a href="https://github.com/sponsors/4444J99" target="_blank">github.com/sponsors/4444J99</a></span><span class="status live">LIVE</span></div>
     <div class="row"><span class="label">Buy Me a Coffee</span><span class="val" id="rail-bmc">loading…</span></div>
-    <div class="row"><span class="label">Stripe Checkout</span><span class="val" id="rail-stripe-val">card checkout pending</span><span class="status latent" id="rail-stripe">LATENT</span></div>
+    <div class="row"><span class="label">Stripe Checkout</span><span class="val">card_payments activating</span><span class="status latent" id="rail-stripe">LATENT</span></div>
   </div>
 </section>
 
@@ -293,11 +293,8 @@ async function loadRails() {
       ? `<a href="${escapeHtml(d.bmc_url)}" target="_blank">${escapeHtml(d.bmc_url)}</a> <span class="status live">LIVE</span>`
       : 'BMC pending';
     if (d.stripe_active) {
-      document.getElementById('rail-stripe-val').textContent = 'Stripe Checkout subscriptions';
       document.getElementById('rail-stripe').textContent = 'LIVE';
       document.getElementById('rail-stripe').className = 'status live';
-    } else {
-      document.getElementById('rail-stripe-val').textContent = 'not configured';
     }
   } catch (e) {}
 }
@@ -446,19 +443,13 @@ async function startCheckout() {
   const email = document.getElementById('co-email').value.trim();
   const msg = document.getElementById('co-msg');
   if (!email || !/^[^@]+@[^@]+\.[^@]+$/.test(email)) { msg.style.color = 'var(--high)'; msg.textContent = 'enter a valid email'; return; }
-  btn.disabled = true; btn.textContent = 'starting…';
+  btn.disabled = true; btn.textContent = 'getting quote…';
   try {
-    const r = await fetch('/api/checkout', {
+    const r = await fetch('/api/subscribe', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ email, tier: CO.tier })
     });
     const d = await r.json();
-    if (r.status === 402 && (d.checkout_url || (d.provider === 'stripe' && d.checkout))) {
-      if (d.session_id) sessionStorage.setItem('vp_checkout_session', d.session_id);
-      msg.style.color = 'var(--muted)'; msg.textContent = 'Redirecting to Stripe Checkout…';
-      window.location.href = d.checkout_url || d.checkout;
-      return;
-    }
     if (r.status === 402 && d.pay_to) {
       CO.quote_id = d.quote_id; CO.address = d.pay_to.address; CO.confirm_url = d.confirm_url || '/api/confirm';
       document.getElementById('q-amount').textContent = `${d.pay_to.amount} ${d.pay_to.asset}`;
@@ -476,43 +467,7 @@ async function startCheckout() {
   } catch (e) {
     msg.style.color = 'var(--high)'; msg.textContent = 'network error — try again';
   } finally {
-    btn.disabled = false; btn.textContent = 'Start checkout';
-  }
-}
-
-async function claimStripeCheckoutFromUrl() {
-  const params = new URLSearchParams(window.location.search);
-  const sessionId = params.get('session_id') || sessionStorage.getItem('vp_checkout_session');
-  if (params.get('checkout') !== 'success' || !sessionId) return;
-  const sec = document.getElementById('checkout');
-  const msg = document.getElementById('co-msg');
-  sec.style.display = '';
-  sec.scrollIntoView({ behavior: 'smooth' });
-  msg.style.color = 'var(--muted)';
-  msg.textContent = 'Activating your paid API key…';
-  try {
-    const r = await fetch('/api/checkout/claim', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session_id: sessionId })
-    });
-    const d = await r.json();
-    if (r.ok && d.api_key) {
-      localStorage.setItem('vp_api_key', d.api_key);
-      sessionStorage.removeItem('vp_checkout_session');
-      msg.style.color = 'var(--ok)';
-      msg.innerHTML = `${escapeHtml(d.tier).toUpperCase()} active — your API key:<br><code style="word-break:break-all">${escapeHtml(d.api_key)}</code>`;
-      const cleanUrl = `${window.location.origin}${window.location.pathname}`;
-      window.history.replaceState({}, document.title, cleanUrl);
-      await loadDashboard();
-      await loadLatest();
-      await loadPatchNow();
-    } else {
-      msg.style.color = 'var(--high)';
-      msg.textContent = d.error || 'payment is not complete yet';
-    }
-  } catch (e) {
-    msg.style.color = 'var(--high)';
-    msg.textContent = 'could not claim checkout — try again shortly';
+    btn.disabled = false; btn.textContent = 'Get payment details';
   }
 }
 
@@ -537,16 +492,7 @@ async function confirmTx() {
       body: JSON.stringify({ quote_id: CO.quote_id, tx_hash: tx })
     });
     const d = await r.json();
-    if (r.ok) {
-      if (d.api_key) localStorage.setItem('vp_api_key', d.api_key);
-      msg.style.color = 'var(--ok)';
-      msg.innerHTML = d.api_key
-        ? `${escapeHtml(CO.tier).toUpperCase()} unlocked — your API key:<br><code style="word-break:break-all">${escapeHtml(d.api_key)}</code>`
-        : `${escapeHtml(CO.tier)} unlocked — receipt recorded.`;
-      await loadDashboard();
-      await loadLatest();
-      await loadPatchNow();
-    }
+    if (r.ok) { msg.style.color = 'var(--ok)'; msg.textContent = `✓ ${CO.tier} unlocked — receipt recorded. We'll email your webhook setup.`; }
     else { msg.style.color = 'var(--high)'; msg.textContent = d.error || 'payment not verified yet — on-chain confirmation can take a moment, try again shortly'; }
   } catch (e) {
     msg.style.color = 'var(--high)'; msg.textContent = 'network error — try again';
@@ -559,12 +505,10 @@ function escapeHtml(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
-claimStripeCheckoutFromUrl().finally(() => {
-  loadDashboard();
-  loadLatest();
-  loadPatchNow();
-  loadRails();
-});
+loadDashboard();
+loadLatest();
+loadPatchNow();
+loadRails();
 </script>
 
 </body>
