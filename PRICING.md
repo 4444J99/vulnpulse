@@ -6,6 +6,9 @@ higher quotas. The machine-readable version of this table lives at
 [`/api/pricing`](https://vulnpulse.ivixivi.workers.dev/api/pricing) — clients
 should render their own upgrade UI from that endpoint rather than hard-coding it.
 
+For endpoint contracts, response examples, and paid checkout flows, see the
+full customer [API guide](./docs/API.md).
+
 ## Tiers
 
 | Tier  | Price   | Daily API | Digest                | Raw CVE detail (`/api/cve/*`) | Real-time webhook |

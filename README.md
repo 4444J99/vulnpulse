@@ -4,6 +4,8 @@
 
 **Live:** https://vulnpulse.ivixivi.workers.dev
 
+**API docs:** [docs/API.md](./docs/API.md)
+
 VulnPulse turns the NVD CVE firehose into a short, defender-focused feed. It
 pulls high and critical CVEs (CVSS >= 7.0) from the NVD JSON 2.0 API, runs the
 top findings through Cloudflare Workers AI, and stores a daily digest with
@@ -148,6 +150,9 @@ npx wrangler deploy
 
 All API responses are JSON.
 
+For customer-ready endpoint contracts, response schemas, payment flows, and
+copy-paste integration examples, see the full [API guide](./docs/API.md).
+
 ### Authentication
 
 Keys can be supplied three ways:
@@ -218,6 +223,9 @@ curl -sS -X POST https://vulnpulse.ivixivi.workers.dev/api/run-now
 `/api/run-now` is separately rate-limited to one request per hour per IP.
 
 ## API Reference
+
+The full customer reference lives in [docs/API.md](./docs/API.md). The short
+index below mirrors the implemented route surface.
 
 Gated CVE-intelligence endpoints resolve a tier and count against the caller's
 daily quota:
