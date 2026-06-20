@@ -47,10 +47,17 @@ header (seconds until 00:00 UTC, when budgets reset).
 
 - **Free** — `POST /api/subscribe` with `{ "email": "you@example.com" }`.
   The response includes your `api_key`.
-- **Pro / Team** — `POST /api/subscribe` with `{ "email": "...", "tier": "pro" }`.
-  You'll get a `402` carrying an on-chain payment quote (USDC). Pay, then
-  `POST /api/confirm` with `{ "quote_id", "tx_hash" }`; the success response
-  includes your paid `api_key`.
+- **Pro / Team** — `POST /api/checkout` with
+  `{ "email": "...", "tier": "pro" }`. When Stripe is configured, you'll get a
+  `402` carrying `provider: "stripe"`, a `checkout_url`, and `session_id`.
+  Complete Stripe Checkout, then `POST /api/checkout/claim` with
+  `{ "session_id" }`; the success response includes your paid `api_key`.
+  If Stripe is not configured, checkout falls back to a USDC quote and
+  `POST /api/confirm` with `{ "quote_id", "tx_hash" }`.
+
+Paid API keys remain tied to their backing subscription. If Stripe later sends a
+cancellation or failed-payment webhook, premium endpoints return
+`402 subscription_inactive` until the subscription is active again.
 
 See [`/api/rails`](https://vulnpulse.ivixivi.workers.dev/api/rails) for every
 active payment rail (crypto, GitHub Sponsors, Buy Me a Coffee, Stripe).
@@ -70,8 +77,9 @@ GET /api/cve/CVE-YYYY-XXXXX     # also 24h-delayed for free
 Ungated (control plane & discovery — free, unmetered):
 
 ```
-POST /api/subscribe   POST /api/confirm   GET /api/pay-status
-GET  /api/status      GET  /api/rails     GET /api/pricing     GET /api/me
+POST /api/subscribe   POST /api/checkout  POST /api/checkout/claim
+POST /api/confirm     GET /api/pay-status
+GET  /api/status      GET /api/rails      GET /api/pricing     GET /api/me
 POST /api/run-now     # separately rate-limited: 1/hour/IP
 ```
 

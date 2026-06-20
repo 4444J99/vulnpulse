@@ -64,7 +64,7 @@ function requireContentType(req: Request, expected: string): boolean {
   return ct.startsWith(expected);
 }
 
-function requireBody(req: Request, rid: string): Promise<unknown> {
+function requireBody(req: Request, _rid: string): Promise<unknown> {
   const cl = req.headers.get('content-length');
   if (cl && Number(cl) > HTTP_BODY_MAX) {
     throw new HttpError(413, 'payload_too_large', `Request body exceeds ${HTTP_BODY_MAX} bytes`);
@@ -107,6 +107,12 @@ interface Env {
   USER_AGENT: string;
   TREASURY_WALLET?: string;
   STRIPE_PUBLIC?: string;
+  STRIPE_SECRET_KEY?: string;
+  STRIPE_WEBHOOK_SECRET?: string;
+  STRIPE_PRO_PRICE_ID?: string;
+  STRIPE_TEAM_PRICE_ID?: string;
+  STRIPE_SUCCESS_URL?: string;
+  STRIPE_CANCEL_URL?: string;
   BMC_HANDLE?: string;
   ADMIN_AUTH?: string;
   // Shared fleet money rail. PAYRAIL is a service binding (preferred — a direct
@@ -165,10 +171,12 @@ const RATE_LIMIT_KEY_PREFIX = 'rl:';
 // *limited* digest (highlights capped) and *delayed* raw CVE detail (records
 // modified <24h ago are paywalled). Pro/Team unlock full + real-time.
 type Tier = 'free' | 'pro' | 'team';
+type PaidTier = Exclude<Tier, 'free'>;
 const API_KEY_PREFIX = 'key:';
 const TIER_DAILY_API_LIMIT: Record<Tier, number> = { free: 50, pro: 5000, team: 50000 };
 const FREE_DELAY_MS = 24 * 60 * 60 * 1000; // free sees raw CVE detail 24h late
 const FREE_HIGHLIGHT_CAP = 5; // free digest endpoints return at most this many CVEs
+const ACTIVE_SUBSCRIPTION_STATUSES = new Set(['active', 'trialing']);
 
 // === payrail (shared fleet money rail) ===
 // vulnpulse plugs into the live payrail Worker instead of re-implementing
@@ -176,6 +184,7 @@ const FREE_HIGHLIGHT_CAP = 5; // free digest endpoints return at most this many 
 // (quote_id); the buyer pays on-chain, then /api/confirm records the receipt.
 const PAYRAIL_DEFAULT = 'https://payrail.ivixivi.workers.dev';
 const TIER_PRICE: Record<'pro' | 'team', string> = { pro: '29', team: '99' };
+const STRIPE_API = 'https://api.stripe.com/v1';
 
 interface PayrailQuote {
   quote_id: string;
@@ -221,6 +230,161 @@ async function hmacHex(secret: string, message: string): Promise<string> {
   );
   const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(message));
   return [...new Uint8Array(sig)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// === Stripe Checkout + subscription licenses ===
+
+interface StripeCheckoutSession {
+  id: string;
+  url?: string | null;
+  mode?: string;
+  status?: string | null;
+  payment_status?: string | null;
+  client_reference_id?: string | null;
+  customer?: string | { id?: string } | null;
+  customer_email?: string | null;
+  subscription?: string | { id?: string; status?: string; metadata?: Record<string, string> } | null;
+  metadata?: Record<string, string> | null;
+}
+
+interface StripeSubscription {
+  id: string;
+  status?: string;
+  customer?: string | { id?: string } | null;
+  metadata?: Record<string, string> | null;
+}
+
+interface StripeEvent {
+  id: string;
+  type: string;
+  data: { object: any };
+}
+
+interface StripeLicenseIndex {
+  api_key: string;
+  tier: PaidTier;
+  ident_hash: string;
+  status: string;
+  stripe_session_id: string;
+  stripe_customer_id?: string;
+  stripe_subscription_id?: string;
+  updated_at: string;
+}
+
+function stripePriceId(env: Env, tier: PaidTier): string | undefined {
+  return tier === 'pro' ? env.STRIPE_PRO_PRICE_ID : env.STRIPE_TEAM_PRICE_ID;
+}
+
+function stripeCheckoutConfigured(env: Env, tier?: PaidTier): boolean {
+  if (!env.STRIPE_SECRET_KEY) return false;
+  if (tier) return !!stripePriceId(env, tier);
+  return !!env.STRIPE_PRO_PRICE_ID || !!env.STRIPE_TEAM_PRICE_ID;
+}
+
+function normalizePaidTier(v: unknown): PaidTier | null {
+  return v === 'pro' || v === 'team' ? v : null;
+}
+
+function stripeObjectId(v: unknown): string | undefined {
+  if (typeof v === 'string') return v;
+  if (v && typeof v === 'object' && typeof (v as { id?: unknown }).id === 'string') return (v as { id: string }).id;
+  return undefined;
+}
+
+function stripeSubscriptionStatus(v: unknown): string | undefined {
+  if (v && typeof v === 'object' && typeof (v as { status?: unknown }).status === 'string') return (v as { status: string }).status;
+  return undefined;
+}
+
+function stripeSuccessUrl(req: Request, env: Env): string {
+  if (env.STRIPE_SUCCESS_URL) return env.STRIPE_SUCCESS_URL;
+  const origin = new URL(req.url).origin;
+  return `${origin}/?checkout=success&session_id={CHECKOUT_SESSION_ID}`;
+}
+
+function stripeCancelUrl(req: Request, env: Env): string {
+  if (env.STRIPE_CANCEL_URL) return env.STRIPE_CANCEL_URL;
+  return `${new URL(req.url).origin}/#pricing`;
+}
+
+async function stripeRequest<T>(env: Env, path: string, init?: RequestInit): Promise<T> {
+  if (!env.STRIPE_SECRET_KEY) throw new HttpError(503, 'stripe_not_configured');
+  const headers = new Headers(init?.headers);
+  headers.set('authorization', `Bearer ${env.STRIPE_SECRET_KEY}`);
+  const r = await fetch(`${STRIPE_API}${path}`, { ...init, headers });
+  const text = await r.text();
+  const parsed = text ? tryParseJson(text) : {};
+  if (!r.ok) {
+    const detail = parsed ?? text;
+    throw new HttpError(502, 'stripe_request_failed', `Stripe request failed (${r.status})`, detail);
+  }
+  return parsed as T;
+}
+
+async function stripeCreateCheckoutSession(req: Request, env: Env, sub: Sub, ident: string): Promise<StripeCheckoutSession> {
+  const tier = normalizePaidTier(sub.tier);
+  if (!tier) throw new HttpError(400, 'validation_error', 'paid tier required');
+  const priceId = stripePriceId(env, tier);
+  if (!env.STRIPE_SECRET_KEY || !priceId) throw new HttpError(503, 'stripe_not_configured');
+
+  const identHash = hash(ident);
+  const params = new URLSearchParams();
+  params.set('mode', 'subscription');
+  params.set('client_reference_id', identHash);
+  params.set('customer_email', ident);
+  params.set('line_items[0][price]', priceId);
+  params.set('line_items[0][quantity]', '1');
+  params.set('allow_promotion_codes', 'true');
+  params.set('success_url', stripeSuccessUrl(req, env));
+  params.set('cancel_url', stripeCancelUrl(req, env));
+  params.set('metadata[product]', 'vulnpulse');
+  params.set('metadata[tier]', tier);
+  params.set('metadata[ident_hash]', identHash);
+  params.set('metadata[email]', ident);
+  params.set('subscription_data[metadata][product]', 'vulnpulse');
+  params.set('subscription_data[metadata][tier]', tier);
+  params.set('subscription_data[metadata][ident_hash]', identHash);
+
+  return stripeRequest<StripeCheckoutSession>(env, '/checkout/sessions', {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: params.toString(),
+  });
+}
+
+async function stripeRetrieveCheckoutSession(env: Env, sessionId: string): Promise<StripeCheckoutSession> {
+  if (!/^cs_(test|live)_[A-Za-z0-9_]+$/.test(sessionId)) {
+    throw new HttpError(400, 'validation_error', 'invalid Stripe Checkout session id');
+  }
+  const qs = new URLSearchParams();
+  qs.append('expand[]', 'subscription');
+  return stripeRequest<StripeCheckoutSession>(env, `/checkout/sessions/${encodeURIComponent(sessionId)}?${qs.toString()}`);
+}
+
+function stripeSessionComplete(session: StripeCheckoutSession): boolean {
+  const paid = session.payment_status === 'paid' || session.payment_status === 'no_payment_required';
+  return session.status === 'complete' && paid;
+}
+
+function timingSafeEqualHex(a: string, b: string): boolean {
+  if (!/^[0-9a-f]+$/i.test(a) || !/^[0-9a-f]+$/i.test(b)) return false;
+  const len = Math.max(a.length, b.length);
+  let diff = a.length ^ b.length;
+  for (let i = 0; i < len; i += 1) {
+    diff |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
+  }
+  return diff === 0;
+}
+
+async function verifyStripeSignature(rawBody: string, signatureHeader: string, secret: string): Promise<boolean> {
+  const parts = signatureHeader.split(',').map(p => p.trim());
+  const timestamp = parts.find(p => p.startsWith('t='))?.slice(2);
+  const signatures = parts.filter(p => p.startsWith('v1=')).map(p => p.slice(3));
+  if (!timestamp || signatures.length === 0 || !/^\d+$/.test(timestamp)) return false;
+  const age = Math.abs(Math.floor(Date.now() / 1000) - Number(timestamp));
+  if (age > 5 * 60) return false;
+  const expected = await hmacHex(secret, `${timestamp}.${rawBody}`);
+  return signatures.some(sig => timingSafeEqualHex(sig, expected));
 }
 
 // === NVD fetch ===
@@ -470,6 +634,78 @@ interface Sub {
   created_at: string;
   auth_value?: string; // for paid tiers
   api_key?: string;    // issued at subscribe (free) / confirm (paid)
+  provider?: 'stripe' | 'payrail' | 'manual';
+  subscription_status?: string;
+  stripe_customer_id?: string;
+  stripe_subscription_id?: string;
+  stripe_session_id?: string;
+}
+
+async function startPaidCheckout(req: Request, env: Env, rid: string, sub: Sub, ident: string): Promise<Response> {
+  const tier = normalizePaidTier(sub.tier);
+  if (!tier) return errorBody(400, 'validation_error', 'tier must be pro or team');
+
+  if (stripeCheckoutConfigured(env, tier)) {
+    let session: StripeCheckoutSession;
+    try {
+      session = await stripeCreateCheckoutSession(req, env, { ...sub, tier }, ident);
+    } catch (err) {
+      structuredLog(rid, 'error', 'stripe_checkout_failed', { tier, error: String(err) });
+      if (err instanceof HttpError) return errorBody(err.status, err.code, err.message, err.detail ? { detail: err.detail } : undefined);
+      return errorBody(502, 'stripe_checkout_failed', String(err));
+    }
+    if (!session.id || !session.url) {
+      structuredLog(rid, 'error', 'stripe_checkout_missing_url', { tier, session_id: session.id });
+      return errorBody(502, 'stripe_checkout_failed', 'Stripe did not return a checkout URL');
+    }
+    await env.VP_SUBS.put(
+      `pending:stripe:${session.id}`,
+      JSON.stringify({
+        ...sub,
+        tier,
+        ident,
+        provider: 'stripe',
+        stripe_session_id: session.id,
+        stripe_customer_id: stripeObjectId(session.customer),
+      }),
+      { expirationTtl: 60 * 60 * 24 * 7 },
+    );
+    return Response.json({
+      status: 'payment_required',
+      provider: 'stripe',
+      tier,
+      checkout: session.url,
+      checkout_url: session.url,
+      session_id: session.id,
+      claim_url: '/api/checkout/claim',
+      instructions: 'Complete Stripe Checkout, then return here to claim your paid API key.',
+    }, { status: 402 });
+  }
+
+  // Paid fallback: live USDC quote via payrail.
+  let q: PayrailQuote;
+  try {
+    q = await payrailQuote(env, tier);
+  } catch (err) {
+    structuredLog(rid, 'error', 'payrail_quote_failed', { tier, error: String(err) });
+    return errorBody(502, 'rail_unavailable', String(err));
+  }
+  await env.VP_SUBS.put(
+    `pending:${q.quote_id}`,
+    JSON.stringify({ ...sub, tier, ident, quote_id: q.quote_id, provider: 'payrail' }),
+    { expirationTtl: 60 * 60 * 24 * 7 },
+  );
+  return Response.json({
+    status: 'payment_required',
+    provider: 'payrail',
+    tier,
+    quote_id: q.quote_id,
+    pay_to: q.pay_to,
+    checkout: q.checkout,
+    instructions: q.instructions,
+    expires_in_seconds: q.expires_in_seconds,
+    confirm_url: '/api/confirm',
+  }, { status: 402 });
 }
 
 async function handleSubscribe(req: Request, env: Env, rid: string): Promise<Response> {
@@ -494,32 +730,10 @@ async function handleSubscribe(req: Request, env: Env, rid: string): Promise<Res
     filter: body.filter ?? { min_score: 7.0 },
     created_at: new Date().toISOString(),
   };
-  // Paid tier: get a live quote from the shared payrail rail and return a 402
-  // carrying the on-chain address + memo (quote_id). The buyer pays, then POSTs
-  // the tx hash to /api/confirm to unlock. No more "wired-but-unset" 503.
+  // Paid tier: prefer Stripe Checkout when configured; otherwise use the
+  // shared payrail quote/receipt rail.
   if (sub.tier !== 'free') {
-    let q: PayrailQuote;
-    try {
-      q = await payrailQuote(env, sub.tier);
-    } catch (err) {
-      structuredLog(rid, 'error', 'payrail_quote_failed', { tier: sub.tier, error: String(err) });
-      return errorBody(502, 'rail_unavailable', String(err));
-    }
-    await env.VP_SUBS.put(
-      `pending:${q.quote_id}`,
-      JSON.stringify({ ...sub, ident, quote_id: q.quote_id }),
-      { expirationTtl: 60 * 60 * 24 * 7 },
-    );
-    return Response.json({
-      status: 'payment_required',
-      tier: sub.tier,
-      quote_id: q.quote_id,
-      pay_to: q.pay_to,
-      checkout: q.checkout,
-      instructions: q.instructions,
-      expires_in_seconds: q.expires_in_seconds,
-      confirm_url: '/api/confirm',
-    }, { status: 402 });
+    return startPaidCheckout(req, env, rid, sub, ident);
   }
   const apiKey = await issueApiKey(env, 'free', hash(ident));
   sub.api_key = apiKey;
@@ -579,7 +793,7 @@ async function handleConfirm(req: Request, env: Env, rid: string): Promise<Respo
   }
   const receiptResp = await rr.json().catch(() => ({})) as { ok?: boolean; receipt?: unknown };
 
-  const apiKey = await issueApiKey(env, tier, hash(pending.ident));
+  const apiKey = await issueApiKey(env, tier, hash(pending.ident), { provider: 'payrail', status: 'active' });
   const active: Sub = {
     email: pending.email,
     webhook: pending.webhook,
@@ -588,6 +802,8 @@ async function handleConfirm(req: Request, env: Env, rid: string): Promise<Respo
     created_at: pending.created_at,
     auth_value: body.quote_id,
     api_key: apiKey,
+    provider: 'payrail',
+    subscription_status: 'active',
   };
   await env.VP_SUBS.put(`sub:${hash(pending.ident)}`, JSON.stringify(active));
   await env.VP_SUBS.delete(`pending:${body.quote_id}`);
@@ -621,6 +837,12 @@ interface ApiKeyRecord {
   tier: Tier;
   ident_hash: string;
   created_at: string;
+  status?: string;
+  provider?: 'stripe' | 'payrail' | 'manual';
+  stripe_customer_id?: string;
+  stripe_subscription_id?: string;
+  stripe_session_id?: string;
+  updated_at?: string;
 }
 
 // Tier-prefixed opaque token: vpf_/vpp_/vpt_ + 24 random bytes hex. The prefix
@@ -632,11 +854,223 @@ function genApiKey(tier: Tier): string {
   return `${prefix}_${hex}`;
 }
 
-async function issueApiKey(env: Env, tier: Tier, identHash: string): Promise<string> {
+async function issueApiKey(env: Env, tier: Tier, identHash: string, extra: Partial<ApiKeyRecord> = {}): Promise<string> {
   const key = genApiKey(tier);
-  const rec: ApiKeyRecord = { tier, ident_hash: identHash, created_at: new Date().toISOString() };
+  const now = new Date().toISOString();
+  const rec: ApiKeyRecord = { tier, ident_hash: identHash, created_at: now, status: 'active', ...extra };
   await env.VP_SUBS.put(`${API_KEY_PREFIX}${key}`, JSON.stringify(rec));
   return key;
+}
+
+function apiKeyRecordActive(rec: ApiKeyRecord): boolean {
+  if (rec.tier === 'free') return true;
+  return !rec.status || ACTIVE_SUBSCRIPTION_STATUSES.has(rec.status);
+}
+
+async function putStripeLicenseIndexes(env: Env, index: StripeLicenseIndex): Promise<void> {
+  await env.VP_SUBS.put(`stripe_session:${index.stripe_session_id}`, JSON.stringify(index));
+  if (index.stripe_subscription_id) {
+    await env.VP_SUBS.put(`stripe_sub:${index.stripe_subscription_id}`, JSON.stringify(index));
+  }
+}
+
+async function updateApiKeyStatus(env: Env, apiKey: string, status: string): Promise<ApiKeyRecord | null> {
+  const raw = await env.VP_SUBS.get(`${API_KEY_PREFIX}${apiKey}`);
+  if (!raw) return null;
+  let rec: ApiKeyRecord;
+  try { rec = JSON.parse(raw) as ApiKeyRecord; } catch { return null; }
+  rec.status = status;
+  rec.updated_at = new Date().toISOString();
+  await env.VP_SUBS.put(`${API_KEY_PREFIX}${apiKey}`, JSON.stringify(rec));
+  return rec;
+}
+
+async function updateStripeSubscriptionStatus(env: Env, subscriptionId: string, status: string, rid: string): Promise<boolean> {
+  const indexRaw = await env.VP_SUBS.get(`stripe_sub:${subscriptionId}`);
+  if (!indexRaw) {
+    structuredLog(rid, 'info', 'stripe_subscription_status_ignored', { subscription_id: subscriptionId, status });
+    return false;
+  }
+  let index: StripeLicenseIndex;
+  try { index = JSON.parse(indexRaw) as StripeLicenseIndex; } catch { return false; }
+  index.status = status;
+  index.updated_at = new Date().toISOString();
+  await putStripeLicenseIndexes(env, index);
+  const rec = await updateApiKeyStatus(env, index.api_key, status);
+  if (rec) {
+    const subRaw = await env.VP_SUBS.get(`sub:${rec.ident_hash}`);
+    if (subRaw) {
+      try {
+        const sub = JSON.parse(subRaw) as Sub;
+        sub.subscription_status = status;
+        sub.stripe_subscription_id = subscriptionId;
+        await env.VP_SUBS.put(`sub:${rec.ident_hash}`, JSON.stringify(sub));
+      } catch { /* keep the key record as source of truth */ }
+    }
+  }
+  structuredLog(rid, 'info', 'stripe_subscription_status_updated', { subscription_id: subscriptionId, status });
+  return true;
+}
+
+async function activateStripeLicense(env: Env, session: StripeCheckoutSession, rid: string): Promise<{ api_key: string; tier: PaidTier; status: string; created: boolean }> {
+  if (!session.id) throw new HttpError(400, 'validation_error', 'missing Stripe session id');
+  const metadata = session.metadata ?? {};
+  if (metadata.product && metadata.product !== 'vulnpulse') throw new HttpError(400, 'validation_error', 'Stripe session is not for VulnPulse');
+
+  const existingSessionRaw = await env.VP_SUBS.get(`stripe_session:${session.id}`);
+  if (existingSessionRaw) {
+    try {
+      const existing = JSON.parse(existingSessionRaw) as StripeLicenseIndex;
+      await updateApiKeyStatus(env, existing.api_key, 'active');
+      existing.status = 'active';
+      existing.updated_at = new Date().toISOString();
+      await putStripeLicenseIndexes(env, existing);
+      return { api_key: existing.api_key, tier: existing.tier, status: existing.status, created: false };
+    } catch { /* rebuild from session below */ }
+  }
+
+  const pendingRaw = await env.VP_SUBS.get(`pending:stripe:${session.id}`);
+  const pending = pendingRaw ? JSON.parse(pendingRaw) as Sub & { ident?: string } : null;
+  const tier = normalizePaidTier(pending?.tier ?? metadata.tier);
+  if (!tier) throw new HttpError(400, 'validation_error', 'missing paid tier metadata');
+
+  const ident = pending?.ident ?? session.customer_email ?? metadata.email ?? '';
+  const identHash = pending?.ident ? hash(pending.ident) : metadata.ident_hash ?? session.client_reference_id ?? (ident ? hash(ident) : '');
+  if (!identHash) throw new HttpError(400, 'validation_error', 'missing subscriber identity metadata');
+
+  const stripeCustomerId = stripeObjectId(session.customer);
+  const stripeSubscriptionId = stripeObjectId(session.subscription);
+  const status = stripeSubscriptionStatus(session.subscription) ?? 'active';
+
+  let apiKey: string | undefined;
+  if (stripeSubscriptionId) {
+    const existingSubRaw = await env.VP_SUBS.get(`stripe_sub:${stripeSubscriptionId}`);
+    if (existingSubRaw) {
+      try { apiKey = (JSON.parse(existingSubRaw) as StripeLicenseIndex).api_key; } catch { /* issue below */ }
+    }
+  }
+  if (!apiKey) {
+    apiKey = await issueApiKey(env, tier, identHash, {
+      provider: 'stripe',
+      status,
+      stripe_customer_id: stripeCustomerId,
+      stripe_subscription_id: stripeSubscriptionId,
+      stripe_session_id: session.id,
+    });
+  } else {
+    await updateApiKeyStatus(env, apiKey, status);
+  }
+
+  const active: Sub = {
+    email: pending?.email ?? session.customer_email ?? metadata.email,
+    webhook: pending?.webhook,
+    tier,
+    filter: pending?.filter,
+    created_at: pending?.created_at ?? new Date().toISOString(),
+    auth_value: stripeSubscriptionId ?? session.id,
+    api_key: apiKey,
+    provider: 'stripe',
+    subscription_status: status,
+    stripe_customer_id: stripeCustomerId,
+    stripe_subscription_id: stripeSubscriptionId,
+    stripe_session_id: session.id,
+  };
+  await env.VP_SUBS.put(`sub:${identHash}`, JSON.stringify(active));
+  await putStripeLicenseIndexes(env, {
+    api_key: apiKey,
+    tier,
+    ident_hash: identHash,
+    status,
+    stripe_session_id: session.id,
+    stripe_customer_id: stripeCustomerId,
+    stripe_subscription_id: stripeSubscriptionId,
+    updated_at: new Date().toISOString(),
+  });
+  await env.VP_SUBS.delete(`pending:stripe:${session.id}`);
+  structuredLog(rid, 'info', 'stripe_license_activated', { tier, session_id: session.id, subscription_id: stripeSubscriptionId });
+  return { api_key: apiKey, tier, status, created: true };
+}
+
+async function handleCheckout(req: Request, env: Env, rid: string): Promise<Response> {
+  if (req.method !== 'POST') return errorBody(405, 'method_not_allowed', 'POST only');
+  if (!requireContentType(req, 'application/json')) return errorBody(415, 'unsupported_media_type', 'content-type must be application/json');
+  const body = await requireBody(req, rid) as Partial<Sub> | null;
+  const tier = normalizePaidTier(body?.tier);
+  if (!tier) return errorBody(400, 'validation_error', 'tier must be pro or team');
+  if (!body?.email || !validEmail(body.email)) return errorBody(400, 'validation_error', 'valid email required for checkout');
+  const sub: Sub = {
+    email: body.email,
+    webhook: body.webhook,
+    tier,
+    filter: body.filter ?? { min_score: 7.0 },
+    created_at: new Date().toISOString(),
+  };
+  return startPaidCheckout(req, env, rid, sub, body.email);
+}
+
+async function handleStripeClaim(req: Request, env: Env, rid: string): Promise<Response> {
+  let sessionId: string | null = null;
+  if (req.method === 'GET') {
+    sessionId = new URL(req.url).searchParams.get('session_id');
+  } else if (req.method === 'POST') {
+    if (!requireContentType(req, 'application/json')) return errorBody(415, 'unsupported_media_type', 'content-type must be application/json');
+    const body = await requireBody(req, rid) as { session_id?: string } | null;
+    sessionId = body?.session_id ?? null;
+  } else {
+    return errorBody(405, 'method_not_allowed', 'GET or POST only');
+  }
+  if (!sessionId) return errorBody(400, 'validation_error', 'session_id required');
+  const session = await stripeRetrieveCheckoutSession(env, sessionId);
+  if (!stripeSessionComplete(session)) {
+    return errorBody(402, 'payment_pending', 'Stripe Checkout session is not complete yet', {
+      provider: 'stripe',
+      session_id: session.id,
+      status: session.status,
+      payment_status: session.payment_status,
+    });
+  }
+  const activated = await activateStripeLicense(env, session, rid);
+  return Response.json({
+    ok: true,
+    provider: 'stripe',
+    tier: activated.tier,
+    subscription_status: activated.status,
+    api_key: activated.api_key,
+    api_key_usage: 'send as "Authorization: Bearer <key>". Real-time access + ' + TIER_DAILY_API_LIMIT[activated.tier] + ' req/day while your subscription is active.',
+  }, { status: activated.created ? 201 : 200 });
+}
+
+async function handleStripeWebhook(req: Request, env: Env, rid: string): Promise<Response> {
+  if (req.method !== 'POST') return errorBody(405, 'method_not_allowed', 'POST only');
+  if (!env.STRIPE_WEBHOOK_SECRET) return errorBody(503, 'stripe_webhook_not_configured');
+  const raw = await req.text();
+  const signature = req.headers.get('stripe-signature');
+  if (!signature || !(await verifyStripeSignature(raw, signature, env.STRIPE_WEBHOOK_SECRET))) {
+    structuredLog(rid, 'warn', 'stripe_webhook_invalid_signature');
+    return errorBody(400, 'invalid_signature');
+  }
+  let event: StripeEvent;
+  try { event = JSON.parse(raw) as StripeEvent; } catch {
+    return errorBody(400, 'invalid_json');
+  }
+
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object as StripeCheckoutSession;
+    const metadata = session.metadata ?? {};
+    if (metadata.product === 'vulnpulse' && (!session.payment_status || stripeSessionComplete(session))) {
+      await activateStripeLicense(env, session, rid);
+    }
+  } else if (event.type === 'customer.subscription.updated' || event.type === 'customer.subscription.deleted') {
+    const subscription = event.data.object as StripeSubscription;
+    const status = event.type === 'customer.subscription.deleted' ? 'canceled' : subscription.status ?? 'unknown';
+    if (subscription.id) await updateStripeSubscriptionStatus(env, subscription.id, status, rid);
+  } else if (event.type === 'invoice.payment_succeeded' || event.type === 'invoice.payment_failed') {
+    const invoice = event.data.object as { subscription?: string | { id?: string } };
+    const subscriptionId = stripeObjectId(invoice.subscription);
+    if (subscriptionId) await updateStripeSubscriptionStatus(env, subscriptionId, event.type === 'invoice.payment_succeeded' ? 'active' : 'past_due', rid);
+  }
+
+  return Response.json({ received: true });
 }
 
 // Accept the key from Authorization: Bearer, X-API-Key, or ?api_key= (in that
@@ -691,6 +1125,17 @@ async function gateRequest(req: Request, env: Env, rid: string): Promise<{ acces
       return { error: errorBody(401, 'invalid_api_key') };
     }
     tier = rec.tier === 'pro' || rec.tier === 'team' ? rec.tier : 'free';
+    if (!apiKeyRecordActive(rec)) {
+      structuredLog(rid, 'warn', 'gate_inactive_subscription', { tier, status: rec.status, provider: rec.provider });
+      return {
+        error: errorBody(402, 'subscription_inactive', 'paid subscription is not active', {
+          tier,
+          status: rec.status ?? 'inactive',
+          provider: rec.provider ?? 'unknown',
+          upgrade: '/api/pricing',
+        }),
+      };
+    }
     rateId = `key:${hash(key)}`;
   } else {
     // anonymous → free, metered per source IP so one client can't drain another's
@@ -736,7 +1181,7 @@ function capForTier<T>(items: T[], access: Access): { items: T[]; truncated: boo
 
 // === HTTP ===
 
-async function handleLatest(_req: Request, env: Env, access: Access, rid: string): Promise<Response> {
+async function handleLatest(_req: Request, env: Env, access: Access, _rid: string): Promise<Response> {
   const v = await env.VP_DIGEST.get(LATEST_KEY);
   if (!v) {
     return Response.json({
@@ -748,7 +1193,7 @@ async function handleLatest(_req: Request, env: Env, access: Access, rid: string
   return Response.json(shapeDigestForTier(digest, access), { headers: rateHeaders(access) });
 }
 
-async function handleHistory(_req: Request, env: Env, access: Access, rid: string): Promise<Response> {
+async function handleHistory(_req: Request, env: Env, access: Access, _rid: string): Promise<Response> {
   const list = await env.VP_DIGEST.list({ prefix: DIGEST_KEY_PREFIX, limit: 30 });
   const out: Digest[] = [];
   for (const k of list.keys) {
@@ -761,7 +1206,7 @@ async function handleHistory(_req: Request, env: Env, access: Access, rid: strin
   return Response.json({ count: out.length, digests }, { headers: rateHeaders(access) });
 }
 
-async function handleCritical(_req: Request, env: Env, access: Access, rid: string): Promise<Response> {
+async function handleCritical(_req: Request, env: Env, access: Access, _rid: string): Promise<Response> {
   const v = await env.VP_DIGEST.get(LATEST_KEY);
   if (!v) return Response.json({ critical: [] }, { status: 202, headers: rateHeaders(access) });
   const d = JSON.parse(v) as Digest;
@@ -773,7 +1218,7 @@ async function handleCritical(_req: Request, env: Env, access: Access, rid: stri
   }, { headers: rateHeaders(access) });
 }
 
-async function handlePatchNow(_req: Request, env: Env, access: Access, rid: string): Promise<Response> {
+async function handlePatchNow(_req: Request, env: Env, access: Access, _rid: string): Promise<Response> {
   const v = await env.VP_DIGEST.get(LATEST_KEY);
   if (!v) return Response.json({ patch_now: [] }, { status: 202, headers: rateHeaders(access) });
   const d = JSON.parse(v) as Digest;
@@ -830,7 +1275,7 @@ async function handleRunNow(req: Request, env: Env, rid: string): Promise<Respon
   return Response.json(d);
 }
 
-async function handleStatus(_req: Request, env: Env, rid: string): Promise<Response> {
+async function handleStatus(_req: Request, env: Env, _rid: string): Promise<Response> {
   const list = await env.VP_CVES.list({ prefix: CVE_KEY_PREFIX, limit: 1 });
   const sample = list.keys[0]?.name?.replace(CVE_KEY_PREFIX, '') ?? null;
   const subList = await env.VP_SUBS.list({ prefix: 'sub:', limit: 1 });
@@ -849,32 +1294,34 @@ async function handleStatus(_req: Request, env: Env, rid: string): Promise<Respo
     revenue_rails: {
       crypto_active: !!env.TREASURY_WALLET,
       sponsors: 'github.com/sponsors/4444J99',
-      stripe_active: !!env.STRIPE_PUBLIC,
+      stripe_active: stripeCheckoutConfigured(env),
       bmc_active: !!env.BMC_HANDLE,
     },
   });
 }
 
-async function handleRails(_req: Request, env: Env, rid: string): Promise<Response> {
+async function handleRails(_req: Request, env: Env, _rid: string): Promise<Response> {
   // Public revenue-rail discovery — clients can offer multiple pay options to users.
   return Response.json({
     crypto: env.TREASURY_WALLET ?? null,
     sponsors_url: 'https://github.com/sponsors/4444J99',
-    stripe_active: !!env.STRIPE_PUBLIC,
+    stripe_active: stripeCheckoutConfigured(env),
+    stripe_checkout: stripeCheckoutConfigured(env) ? '/api/checkout' : null,
+    stripe_claim: stripeCheckoutConfigured(env) ? '/api/checkout/claim' : null,
     bmc_url: env.BMC_HANDLE ? `https://www.buymeacoffee.com/${env.BMC_HANDLE}` : null,
   });
 }
 
 // Machine-readable pricing/tier matrix — the source of truth the README and
 // PRICING.md describe in prose. Clients can render their own upgrade UI from it.
-async function handlePricing(_req: Request, _env: Env, rid: string): Promise<Response> {
+async function handlePricing(_req: Request, env: Env, _rid: string): Promise<Response> {
   return Response.json({
     currency: 'USD',
     billing: 'monthly',
     auth: {
       header: 'Authorization: Bearer <api_key>',
       alternatives: ['X-API-Key: <api_key>', '?api_key=<api_key>'],
-      issued_by: 'POST /api/subscribe (free) or POST /api/confirm (paid)',
+      issued_by: 'POST /api/subscribe (free) or POST /api/checkout + /api/checkout/claim (paid Stripe); POST /api/confirm for payrail fallback',
       anonymous: 'no key → free tier, metered per IP',
     },
     tiers: [
@@ -895,6 +1342,13 @@ async function handlePricing(_req: Request, _env: Env, rid: string): Promise<Res
       },
     ],
     pay: '/api/rails',
+    checkout: {
+      stripe_active: stripeCheckoutConfigured(env),
+      start: '/api/checkout',
+      claim: '/api/checkout/claim',
+      webhook: '/api/webhooks/stripe',
+      payrail_confirm: '/api/confirm',
+    },
   });
 }
 
@@ -903,6 +1357,7 @@ async function handlePricing(_req: Request, _env: Env, rid: string): Promise<Res
 async function handleMe(req: Request, env: Env, rid: string): Promise<Response> {
   const key = readApiKey(req);
   let tier: Tier = 'free';
+  let rec: ApiKeyRecord | null = null;
   let rateId: string;
   if (key) {
     const raw = await env.VP_SUBS.get(`${API_KEY_PREFIX}${key}`);
@@ -910,7 +1365,10 @@ async function handleMe(req: Request, env: Env, rid: string): Promise<Response> 
       structuredLog(rid, 'warn', 'me_invalid_key', { key_prefix: key.slice(0, 8) });
       return errorBody(401, 'invalid_api_key');
     }
-    try { tier = (JSON.parse(raw) as ApiKeyRecord).tier; } catch { /* default free */ }
+    try {
+      rec = JSON.parse(raw) as ApiKeyRecord;
+      tier = rec.tier === 'pro' || rec.tier === 'team' ? rec.tier : 'free';
+    } catch { /* default free */ }
     rateId = `key:${hash(key)}`;
   } else {
     const ip = req.headers.get('cf-connecting-ip') ?? 'unknown';
@@ -922,6 +1380,9 @@ async function handleMe(req: Request, env: Env, rid: string): Promise<Response> 
   return Response.json({
     tier,
     authenticated: !!key,
+    active: rec ? apiKeyRecordActive(rec) : true,
+    subscription_status: rec?.status ?? (tier === 'free' ? 'free' : 'unknown'),
+    provider: rec?.provider,
     daily_limit: limit,
     used_today: used,
     remaining_today: Math.max(0, limit - used),
@@ -941,6 +1402,9 @@ export default {
     try {
       // Ungated: subscription/payment control plane + public discovery.
       if (p === '/api/subscribe') return await handleSubscribe(req, env, rid);
+      if (p === '/api/checkout') return await handleCheckout(req, env, rid);
+      if (p === '/api/checkout/claim') return await handleStripeClaim(req, env, rid);
+      if (p === '/api/webhooks/stripe' || p === '/api/webhook/stripe') return await handleStripeWebhook(req, env, rid);
       if (p === '/api/confirm') return await handleConfirm(req, env, rid);
       if (p === '/api/pay-status') return await handlePayStatus(req, env, rid);
       if (p === '/api/run-now' && method === 'POST') return await handleRunNow(req, env, rid);

@@ -110,7 +110,10 @@ Required binding/config:
 - `VP_DIGEST` - latest and historical digest records
 - `VP_SUBS` - subscriptions, pending quotes, and API key records
 - `USER_AGENT` - NVD-friendly user agent string
-- `PAYRAIL` service binding or `PAYRAIL_URL` - paid checkout/receipt rail
+- `STRIPE_SECRET_KEY` plus `STRIPE_PRO_PRICE_ID` / `STRIPE_TEAM_PRICE_ID` -
+  preferred paid subscription checkout
+- `STRIPE_WEBHOOK_SECRET` - verifies Stripe events at `/api/webhooks/stripe`
+- `PAYRAIL` service binding or `PAYRAIL_URL` - USDC checkout/receipt fallback
 
 Optional monetization settings:
 
@@ -232,6 +235,9 @@ intelligence quota:
 
 ```http
 POST /api/subscribe
+POST /api/checkout
+GET  /api/checkout/claim
+POST /api/checkout/claim
 POST /api/confirm
 GET  /api/pay-status
 GET  /api/pricing
@@ -265,17 +271,35 @@ Tier entitlements:
 
 Paid checkout flow:
 
-1. Start a paid quote:
+1. Start a paid checkout:
 
    ```sh
-   curl -i https://vulnpulse.ivixivi.workers.dev/api/subscribe \
+   curl -i https://vulnpulse.ivixivi.workers.dev/api/checkout \
      -H 'content-type: application/json' \
      -d '{"email":"sec@example.com","tier":"pro"}'
    ```
 
-2. The API returns `402 payment_required` with a `quote_id`, USDC payment
-   details, instructions, and `confirm_url`.
-3. Pay through the returned rail, then confirm:
+2. If Stripe is configured, the API returns `402 payment_required` with
+   `provider: "stripe"`, a `checkout_url`, and a `session_id`. Redirect the
+   user to `checkout_url`.
+3. After Stripe redirects back, claim the paid API key:
+
+   ```sh
+   curl -sS https://vulnpulse.ivixivi.workers.dev/api/checkout/claim \
+     -H 'content-type: application/json' \
+     -d '{"session_id":"cs_test_..."}'
+   ```
+
+4. Stripe webhooks also activate and revoke paid licenses. Configure the Stripe
+   endpoint as:
+
+   ```http
+   POST /api/webhooks/stripe
+   ```
+
+5. If Stripe is not configured, the same checkout endpoint falls back to the
+   USDC rail and returns a `quote_id`, payment details, instructions, and
+   `confirm_url`. Pay through the returned rail, then confirm:
 
    ```sh
    curl -sS https://vulnpulse.ivixivi.workers.dev/api/confirm \
@@ -283,14 +307,17 @@ Paid checkout flow:
      -d '{"quote_id":"quote_pro_123","tx_hash":"0x..."}'
    ```
 
-4. The success response returns a paid API key.
+The successful claim/confirm response returns a paid API key. Paid keys work
+only while the backing subscription is active; canceled or past-due Stripe
+subscriptions return `402 subscription_inactive` on premium endpoints.
 
 Payment/discovery rails:
 
+- **Stripe Checkout** - preferred subscription checkout when
+  `STRIPE_SECRET_KEY` and tier price IDs are configured.
 - **USDC crypto checkout** - live through the payrail quote/receipt flow.
 - **GitHub Sponsors** - https://github.com/sponsors/4444J99
 - **Buy Me a Coffee** - exposed when `BMC_HANDLE` is configured.
-- **Stripe Checkout** - exposed as active when `STRIPE_PUBLIC` is configured.
 
 Clients should read `GET /api/rails` and `GET /api/pricing` instead of
 hard-coding payment availability or tier metadata.
@@ -328,6 +355,7 @@ Each summarized CVE keeps the NVD basics plus AI triage fields:
 - Cloudflare Workers KV for CVEs, digests, subscriptions, and API counters
 - Cloudflare static assets for the hosted page in `public/`
 - NVD JSON 2.0 API as the public CVE source
+- Stripe Checkout for paid subscriptions and subscription-status webhooks
 - Payrail service binding for quote and receipt handling
 
 ## Development
