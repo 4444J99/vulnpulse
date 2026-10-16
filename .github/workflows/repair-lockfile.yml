@@ -1,0 +1,77 @@
+name: Repair dependency lockfile
+
+on:
+  push:
+    branches:
+      - repair/vulnpulse-lockfile-20261016
+
+permissions:
+  contents: read
+
+concurrency:
+  group: repair-lockfile-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  generate-and-verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20.20.2
+
+      - name: Confirm the failing run's package-manager version
+        run: |
+          test "$(node --version)" = v20.20.2
+          test "$(npm --version)" = 10.8.2
+
+      - name: Resolve the existing manifest in a clean directory
+        id: generate
+        env:
+          LOCK_WORKSPACE: ${{ runner.temp }}/vulnpulse-lock
+        run: |
+          mkdir -p "$LOCK_WORKSPACE"
+          cp package.json "$LOCK_WORKSPACE/package.json"
+          npm --prefix "$LOCK_WORKSPACE" install --package-lock-only --ignore-scripts --no-audit --no-fund
+          cp "$LOCK_WORKSPACE/package-lock.json" package-lock.json
+
+      - name: Verify strict clean install
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: KV status quota regression
+        run: node --test tests/status-snapshot.test.mjs
+
+      - name: Build
+        run: npm run build
+
+      - name: Preserve candidate lockfile and source identity
+        if: always() && steps.generate.outcome == 'success'
+        run: |
+          git rev-parse HEAD > repair-source-sha.txt
+          sha256sum package.json package-lock.json > repair-checksums.txt
+
+      - name: Upload candidate lockfile
+        if: always() && steps.generate.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: candidate-lockfile
+          path: |
+            package-lock.json
+            repair-source-sha.txt
+            repair-checksums.txt
+          if-no-files-found: error
+          retention-days: 3
