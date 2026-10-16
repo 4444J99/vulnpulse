@@ -1,4 +1,4 @@
-name: Repair dependency lockfile
+name: Retrieve verified dependency lockfile
 
 on:
   push:
@@ -7,96 +7,43 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: repair-lockfile-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  generate-and-verify:
+  retrieve-verified-lockfile:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout the successful verification source
+        uses: actions/checkout@v4
         with:
+          ref: 31aa5b0e8f1c79cf0f8c0959bbf5f1e9e97f035a
           persist-credentials: false
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20.20.2
-
-      - name: Confirm the failing run's package-manager version
-        run: |
-          test "$(node --version)" = v20.20.2
-          test "$(npm --version)" = 10.8.2
-
-      - name: Resolve the existing manifest in a clean directory
-        id: generate
-        env:
-          LOCK_WORKSPACE: ${{ runner.temp }}/vulnpulse-lock
-        run: |
-          mkdir -p "$LOCK_WORKSPACE"
-          cp package.json "$LOCK_WORKSPACE/package.json"
-          # The clean-manifest failure matches npm/cli#8448: a recursive peer
-          # replacement detaches node.parent before #loadPeerSet reads edgesOut.
-          # npm 11.6.0 includes the Arborist fix and supports Node 20.20.2.
-          # Keep strict npm 10.8.2 installation below to test lock compatibility.
-          npx --yes npm@11.6.0 --prefix "$LOCK_WORKSPACE" install --package-lock-only --ignore-scripts --no-audit --no-fund --loglevel verbose --logs-dir "$LOCK_WORKSPACE/npm-logs"
-          cp "$LOCK_WORKSPACE/package-lock.json" package-lock.json
-
-      - name: Show bounded resolver failure diagnostics
-        if: failure() && steps.generate.outcome == 'failure'
-        env:
-          LOCK_WORKSPACE: ${{ runner.temp }}/vulnpulse-lock
-        run: |
-          python3 - <<'PY'
-          from collections import deque
-          from pathlib import Path
-          import os
-
-          logs = list((Path(os.environ["LOCK_WORKSPACE"]) / "npm-logs").glob("*-debug-*.log"))
-          if not logs:
-              print("No resolver debug log was created.")
-          else:
-              latest = max(logs, key=lambda path: path.stat().st_mtime_ns)
-              with latest.open(encoding="utf-8", errors="replace") as stream:
-                  print("".join(deque(stream, maxlen=80)), end="")
-          PY
-
-      - name: Verify strict clean install
-        run: |
-          test "$(npm --version)" = 10.8.2
-          npm ci
-
-      - name: Lint
-        run: npm run lint
-
-      - name: Typecheck
-        run: npm run typecheck
-
-      - name: Test
-        run: npm test
-
-      - name: KV status quota regression
-        run: node --test tests/status-snapshot.test.mjs
-
-      - name: Build
-        run: npm run build
-
-      - name: Preserve candidate lockfile and source identity
-        if: always() && steps.generate.outcome == 'success'
-        run: |
-          git rev-parse HEAD > repair-source-sha.txt
-          sha256sum package.json package-lock.json > repair-checksums.txt
-
-      - name: Upload candidate lockfile
-        if: always() && steps.generate.outcome == 'success'
-        uses: actions/upload-artifact@v4
+      - name: Download the successful run's candidate lockfile
+        uses: actions/download-artifact@v4
         with:
           name: candidate-lockfile
-          path: |
-            package-lock.json
-            repair-source-sha.txt
-            repair-checksums.txt
-          if-no-files-found: error
-          retention-days: 3
+          run-id: 38975839500
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          path: ${{ runner.temp }}/vulnpulse-lock-receipt
+
+      - name: Verify source and checksums, then print the public lockfile receipt
+        env:
+          LOCK_RECEIPT: ${{ runner.temp }}/vulnpulse-lock-receipt
+        run: |
+          test "$(cat "$LOCK_RECEIPT/repair-source-sha.txt")" = 31aa5b0e8f1c79cf0f8c0959bbf5f1e9e97f035a
+          cp package.json "$LOCK_RECEIPT/package.json"
+          cd "$LOCK_RECEIPT"
+          sha256sum --check --strict repair-checksums.txt
+          echo 'BEGIN_VULNPULSE_PACKAGE_LOCK_SHA256'
+          sha256sum package-lock.json
+          echo 'END_VULNPULSE_PACKAGE_LOCK_SHA256'
+          echo 'BEGIN_VULNPULSE_PACKAGE_LOCK_GZIP_BASE64'
+          gzip -n -c package-lock.json | base64 --wrap=76
+          echo 'END_VULNPULSE_PACKAGE_LOCK_GZIP_BASE64'
