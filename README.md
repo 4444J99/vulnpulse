@@ -76,14 +76,34 @@ See [PRICING.md](./PRICING.md) for the full gate spec (auth, quotas, delay rules
 
 ## Development
 
-Run the automated test suite with:
+Install the committed dependency versions and run the automated test suite:
 
-```
+```sh
+npm ci
 npm test
 ```
 
-The tests use Node's built-in test runner with in-memory Worker bindings, so they
-do not need live Cloudflare services.
+The tests use Vitest and Node's built-in test runner with in-memory Worker
+bindings, so they do not need live Cloudflare services.
+
+### Updating the lockfile
+
+npm 10.8.2 and 10.9.9 can crash with a null `edgesOut` error while resolving this
+dependency graph. To regenerate the lockfile from `package.json`, use the pinned
+npm 11.6.0 resolver, which includes the [upstream Arborist fix](https://github.com/npm/cli/pull/8448),
+on a compatible Node version such as 20.20.2:
+
+```sh
+lock_dir="$(mktemp -d)"
+cp package.json "$lock_dir/"
+npx --yes npm@11.6.0 --prefix "$lock_dir" install --package-lock-only --ignore-scripts --no-audit --no-fund
+cp "$lock_dir/package-lock.json" package-lock.json
+npm ci
+```
+
+Commit the regenerated lockfile with any intended manifest changes. Normal
+installs and CI use `npm ci`; the committed lockfile was verified with Node
+20.20.2 and npm 10.8.2, including lint, typecheck, tests and the Worker dry-run build.
 
 ## Sister products
 

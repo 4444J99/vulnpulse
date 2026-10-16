@@ -28,9 +28,7 @@ jobs:
           node-version: 20
 
       - name: Install dependencies
-        # Use `npm ci` once a committed package-lock.json exists; `npm install`
-        # works on the first run before the lockfile is generated.
-        run: npm install
+        run: npm ci
 
       - name: Lint
         run: npm run lint
