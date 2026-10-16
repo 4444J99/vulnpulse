@@ -40,8 +40,27 @@ jobs:
           # The clean-manifest bootstrap also crashes inside npm 10.8.2's
           # resolver. Generate with a bounded newer resolver, then validate
           # the result using the repository's original npm version below.
-          npx --yes npm@10.9.9 --prefix "$LOCK_WORKSPACE" install --package-lock-only --ignore-scripts --no-audit --no-fund
+          npx --yes npm@10.9.9 --prefix "$LOCK_WORKSPACE" install --package-lock-only --ignore-scripts --no-audit --no-fund --loglevel verbose --logs-dir "$LOCK_WORKSPACE/npm-logs"
           cp "$LOCK_WORKSPACE/package-lock.json" package-lock.json
+
+      - name: Show bounded resolver failure diagnostics
+        if: failure() && steps.generate.outcome == 'failure'
+        env:
+          LOCK_WORKSPACE: ${{ runner.temp }}/vulnpulse-lock
+        run: |
+          python3 - <<'PY'
+          from collections import deque
+          from pathlib import Path
+          import os
+
+          logs = list((Path(os.environ["LOCK_WORKSPACE"]) / "npm-logs").glob("*-debug-*.log"))
+          if not logs:
+              print("No resolver debug log was created.")
+          else:
+              latest = max(logs, key=lambda path: path.stat().st_mtime_ns)
+              with latest.open(encoding="utf-8", errors="replace") as stream:
+                  print("".join(deque(stream, maxlen=80)), end="")
+          PY
 
       - name: Verify strict clean install
         run: |
