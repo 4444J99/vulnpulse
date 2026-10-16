@@ -95,6 +95,10 @@ VulnPulse is part of an intelligence portfolio:
 - [BountyScope](https://bountyscope.ivixivi.workers.dev) — Bug-bounty intel + smart-contract analyzer
 - [TrendPulse](https://trendpulse.ivixivi.workers.dev) — Daily emerging-tech digest
 
+## Security
+
+To report a vulnerability in VulnPulse itself, see [SECURITY.md](./SECURITY.md).
+
 ## License
 
 MIT — see [LICENSE](./LICENSE).
